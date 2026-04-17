@@ -139,9 +139,9 @@ def make_gif(coords, tours, costs, output_path, opt_cost=None,
 
         # Render to image
         fig.canvas.draw()
-        w, h = fig.canvas.get_width_height()
-        image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
-        frames.append(image.copy())
+        buf = fig.canvas.buffer_rgba()
+        image = np.asarray(buf)[:, :, :3].copy()  # RGBA -> RGB
+        frames.append(image)
 
     # Add extra copies of last frame (pause at end)
     for _ in range(fps * 2):
