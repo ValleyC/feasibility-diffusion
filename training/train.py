@@ -36,11 +36,20 @@ from problems.tsp.tour import (
     dist_matrix_from_coords, random_tour, is_valid_tour,
 )
 from problems.tsp.data import generate_dataset
+from problems.tsp.edisco_data import load_edisco_tsp
 from models.move_scorer import MoveScorer
 
 
-def prepare_dataset(N, n_instances, seed=42, solver_restarts=5):
-    """Generate instances + near-optimal tours. Returns numpy arrays."""
+def prepare_dataset(N, n_instances, seed=42, solver_restarts=5,
+                    data_path=None, max_instances=None):
+    """Load or generate instances + near-optimal tours.
+
+    If data_path is given, loads EDISCO-format data from file.
+    Otherwise, generates random instances and solves with 2-opt.
+    """
+    if data_path is not None:
+        return load_edisco_tsp(data_path, max_instances=max_instances)
+
     print(f"Generating {n_instances} TSP-{N} instances with 2-opt solutions...")
     t0 = time.time()
     coords_list, dist_list, tour_list, cost_list = generate_dataset(
@@ -170,14 +179,16 @@ def train(args):
     moves_ij = torch.tensor(moves_list, dtype=torch.long, device=device)
     print(f"TSP-{N}: {M} valid 2-opt moves per tour")
 
-    # Generate dataset
+    # Load or generate dataset
     n_train = args.n_train
     n_val = args.n_val
     coords_train, dist_train, tour_train, cost_train = prepare_dataset(
         N, n_train, seed=42, solver_restarts=max(3, N // 5),
+        data_path=args.train_data, max_instances=n_train,
     )
     coords_val, dist_val, tour_val, cost_val = prepare_dataset(
         N, n_val, seed=99999, solver_restarts=max(3, N // 5),
+        data_path=args.val_data, max_instances=n_val,
     )
 
     # Model
@@ -297,6 +308,10 @@ if __name__ == '__main__':
     parser.add_argument('--N', type=int, default=20, help='Number of TSP nodes')
     parser.add_argument('--n_train', type=int, default=1000, help='Training instances')
     parser.add_argument('--n_val', type=int, default=100, help='Validation instances')
+    parser.add_argument('--train_data', type=str, default=None,
+                        help='Path to EDISCO-format training data (skip generation if given)')
+    parser.add_argument('--val_data', type=str, default=None,
+                        help='Path to EDISCO-format validation data')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--n_epochs', type=int, default=30)
     parser.add_argument('--steps_per_epoch', type=int, default=200)
