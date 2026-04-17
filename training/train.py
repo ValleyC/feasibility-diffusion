@@ -83,6 +83,75 @@ def make_training_sample(coords, dist, opt_tour, t, moves_list, N):
     return tour, t, label, deltas[label]
 
 
+def make_training_sample_mixed(coords, dist, moves_list, N,
+                               opt_tour=None, quality_mix=(0.3, 0.3, 0.4)):
+    """Create training sample from mixed-quality tours (no distribution mismatch).
+
+    Samples tours at different quality levels so the model learns to improve
+    tours of ANY quality, not just near-optimal ones:
+      - Random tours (worst quality, matches inference starting point)
+      - Partially improved tours (mid quality, via a few greedy 2-opt steps)
+      - Near-optimal tours (best quality, from training data or heavy 2-opt)
+
+    Args:
+        coords: (N, 2) node coordinates
+        dist: (N, N) distance matrix
+        moves_list: list of (i, j) valid 2-opt moves
+        N: number of nodes
+        opt_tour: optional near-optimal tour (used for "good" quality tier)
+        quality_mix: (p_random, p_partial, p_good) probabilities for each tier
+
+    Returns:
+        tour: (N,) int — tour at some quality level
+        quality: float — normalized quality indicator in [0, 1]
+        label: int — index of best-improving move
+        best_delta: float
+    """
+    p_random, p_partial, p_good = quality_mix
+    roll = np.random.random()
+
+    if roll < p_random:
+        # Tier 1: fully random tour (matches inference starting point)
+        tour = random_tour(N)
+        quality = 0.0
+    elif roll < p_random + p_partial:
+        # Tier 2: random tour improved by k greedy 2-opt steps
+        tour = random_tour(N)
+        k = np.random.randint(1, N * 2)  # 1 to 2N improvement steps
+        for _ in range(k):
+            deltas_k = np.array([delta_2opt(tour, i, j, dist) for i, j in moves_list])
+            best_k = int(np.argmin(deltas_k))
+            if deltas_k[best_k] >= -1e-10:
+                break  # locally optimal
+            tour = apply_2opt(tour, moves_list[best_k][0], moves_list[best_k][1])
+        quality = 0.5
+    else:
+        # Tier 3: near-optimal (from data, or scrambled slightly from optimal)
+        if opt_tour is not None:
+            tour = opt_tour.copy()
+            # Light scramble (0-10 swaps) so model also sees near-optimal states
+            n_scramble = np.random.randint(0, 11)
+            for _ in range(n_scramble):
+                idx = np.random.randint(len(moves_list))
+                tour = apply_2opt(tour, moves_list[idx][0], moves_list[idx][1])
+        else:
+            # Fallback: run greedy 2-opt to convergence
+            tour = random_tour(N)
+            for _ in range(N * 10):
+                deltas_k = np.array([delta_2opt(tour, i, j, dist) for i, j in moves_list])
+                best_k = int(np.argmin(deltas_k))
+                if deltas_k[best_k] >= -1e-10:
+                    break
+                tour = apply_2opt(tour, moves_list[best_k][0], moves_list[best_k][1])
+        quality = 1.0
+
+    # Label: best improving move on this tour
+    deltas = np.array([delta_2opt(tour, i, j, dist) for i, j in moves_list])
+    label = int(np.argmin(deltas))
+
+    return tour, quality, label, deltas[label]
+
+
 @torch.no_grad()
 def greedy_denoise(model, coords_t, dist_np, moves_ij, N, n_steps, t_max,
                    device, start_tour=None):
@@ -114,13 +183,14 @@ def greedy_denoise(model, coords_t, dist_np, moves_ij, N, n_steps, t_max,
     cost_trajectory = [tour_cost(tour_np, dist_np)]
 
     for step in range(n_steps):
-        # Time: decreasing from t_max to 0 (denoising schedule)
-        t_val = max(1, t_max - step)
+        # Quality signal: starts at 0 (random), increases toward 1 (optimal)
+        # as denoising progresses
+        quality = step / max(n_steps - 1, 1)
 
         tour_t = torch.tensor(tour_np, dtype=torch.long, device=device).unsqueeze(0)
-        t_tensor = torch.tensor([t_val], device=device)
+        t_tensor = torch.tensor([quality], device=device)
 
-        scores = model(coords_t, tour_t, t_tensor, t_max, moves_ij)  # (1, M)
+        scores = model(coords_t, tour_t, t_tensor, 1.0, moves_ij)  # (1, M)
         best_idx = scores.argmax(dim=-1).item()
         i, j = moves_list[best_idx]
 
@@ -230,23 +300,22 @@ def train(args):
 
         pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch}")
         for step in pbar:
-            # Build batch
+            # Build batch from mixed-quality tours
             batch_tours = []
             batch_coords = []
             batch_labels = []
             batch_t = []
 
             for _ in range(batch_size):
-                idx = np.random.randint(n_train)
-                t = np.random.randint(1, t_max + 1)
-                tour, t_val, label, _ = make_training_sample(
-                    coords_train[idx], dist_train[idx], tour_train[idx],
-                    t, moves_list, N,
+                idx = np.random.randint(len(coords_train))
+                tour, quality, label, _ = make_training_sample_mixed(
+                    coords_train[idx], dist_train[idx], moves_list, N,
+                    opt_tour=tour_train[idx],
                 )
                 batch_tours.append(tour)
                 batch_coords.append(coords_train[idx])
                 batch_labels.append(label)
-                batch_t.append(t_val)
+                batch_t.append(quality)  # quality as time signal: 0=random, 1=optimal
 
             coords_t = torch.tensor(
                 np.stack(batch_coords), dtype=torch.float32, device=device
@@ -257,8 +326,8 @@ def train(args):
             labels_t = torch.tensor(batch_labels, dtype=torch.long, device=device)
             t_tensor = torch.tensor(batch_t, dtype=torch.float32, device=device)
 
-            # Forward
-            scores = model(coords_t, tours_t, t_tensor, t_max, moves_ij)  # (B, M)
+            # Forward (t_max=1.0 since quality is normalized to [0,1])
+            scores = model(coords_t, tours_t, t_tensor, 1.0, moves_ij)  # (B, M)
 
             # Cross-entropy loss
             loss = F.cross_entropy(scores, labels_t)
