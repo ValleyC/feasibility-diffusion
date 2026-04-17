@@ -205,14 +205,16 @@ def train(args):
         optimizer, T_max=args.n_epochs,
     )
 
-    # Baselines
+    # Baselines (use actual number of loaded val instances, not n_val arg)
+    n_val_actual = len(dist_val)
     random_costs = []
-    for idx in range(n_val):
+    for idx in range(n_val_actual):
         rc = np.mean([tour_cost(random_tour(N), dist_val[idx]) for _ in range(10)])
         random_costs.append(rc)
     print(f"Baselines: optimal={np.mean(cost_val):.4f}, "
           f"random={np.mean(random_costs):.4f} "
-          f"(ratio={np.mean(random_costs)/np.mean(cost_val):.2f}x)")
+          f"(ratio={np.mean(random_costs)/np.mean(cost_val):.2f}x) "
+          f"[{n_val_actual} val instances]")
 
     # Checkpointing
     os.makedirs(args.ckpt_dir, exist_ok=True)
