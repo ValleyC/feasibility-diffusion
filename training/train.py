@@ -35,7 +35,7 @@ from problems.tsp.tour import (
     enumerate_2opt, apply_2opt, delta_2opt, tour_cost,
     dist_matrix_from_coords, random_tour, is_valid_tour,
 )
-from problems.tsp.data import generate_dataset
+from problems.tsp.data import generate_dataset, generate_instance
 from problems.tsp.edisco_data import load_edisco_tsp
 from models.move_scorer import MoveScorer
 
@@ -252,14 +252,35 @@ def train(args):
     # Load or generate dataset
     n_train = args.n_train
     n_val = args.n_val
-    coords_train, dist_train, tour_train, cost_train = prepare_dataset(
-        N, n_train, seed=42, solver_restarts=max(3, N // 5),
-        data_path=args.train_data, max_instances=n_train,
-    )
-    coords_val, dist_val, tour_val, cost_val = prepare_dataset(
-        N, n_val, seed=99999, solver_restarts=max(3, N // 5),
-        data_path=args.val_data, max_instances=n_val,
-    )
+
+    if args.no_labels:
+        # Fully label-free: generate random instances only (no optimal tours)
+        print(f"Label-free mode: generating {n_train} random TSP-{N} instances (no solver)")
+        coords_train = [generate_instance(N, seed=42 + i) for i in range(n_train)]
+        dist_train = [dist_matrix_from_coords(c) for c in coords_train]
+        tour_train = [None] * n_train  # no optimal tours
+        cost_train = [0.0] * n_train
+
+        print(f"Generating {n_val} random validation instances...")
+        coords_val = [generate_instance(N, seed=99999 + i) for i in range(n_val)]
+        dist_val = [dist_matrix_from_coords(c) for c in coords_val]
+        # For validation eval, we still need reference costs (use greedy 2-opt)
+        tour_val, cost_val = [], []
+        for c, d in zip(coords_val, dist_val):
+            from problems.tsp.data import solve_2opt
+            t, tc = solve_2opt(c, max_restarts=3)
+            tour_val.append(t)
+            cost_val.append(tc)
+        print(f"  Val reference cost (2-opt): {np.mean(cost_val):.4f}")
+    else:
+        coords_train, dist_train, tour_train, cost_train = prepare_dataset(
+            N, n_train, seed=42, solver_restarts=max(3, N // 5),
+            data_path=args.train_data, max_instances=n_train,
+        )
+        coords_val, dist_val, tour_val, cost_val = prepare_dataset(
+            N, n_val, seed=99999, solver_restarts=max(3, N // 5),
+            data_path=args.val_data, max_instances=n_val,
+        )
 
     # Model
     model = MoveScorer(
@@ -306,11 +327,18 @@ def train(args):
             batch_labels = []
             batch_t = []
 
+            # Quality mix: with labels (30/30/40), without labels (50/50/0)
+            if args.no_labels:
+                qmix = (0.5, 0.5, 0.0)
+            else:
+                qmix = (0.3, 0.3, 0.4)
+
             for _ in range(batch_size):
                 idx = np.random.randint(len(coords_train))
                 tour, quality, label, _ = make_training_sample_mixed(
                     coords_train[idx], dist_train[idx], moves_list, N,
                     opt_tour=tour_train[idx],
+                    quality_mix=qmix,
                 )
                 batch_tours.append(tour)
                 batch_coords.append(coords_train[idx])
@@ -383,6 +411,8 @@ if __name__ == '__main__':
                         help='Path to EDISCO-format training data (skip generation if given)')
     parser.add_argument('--val_data', type=str, default=None,
                         help='Path to EDISCO-format validation data')
+    parser.add_argument('--no_labels', action='store_true',
+                        help='Fully label-free: no optimal tours, train from random + self-improved only')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--n_epochs', type=int, default=30)
     parser.add_argument('--steps_per_epoch', type=int, default=200)
