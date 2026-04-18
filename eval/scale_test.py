@@ -26,6 +26,7 @@ from problems.tsp.tour import (
     enumerate_2opt, apply_2opt, delta_2opt, tour_cost,
     dist_matrix_from_coords, random_tour, is_valid_tour,
 )
+from problems.tsp.knn_moves import enumerate_2opt_knn, get_sparse_factor
 from problems.tsp.data import generate_instance, solve_2opt
 from models.move_scorer import MoveScorer
 
@@ -55,15 +56,11 @@ def solve_ortools(coords, time_limit_s=10):
 def evaluate_size(model, N, n_instances, n_steps, device, n_trajectories=1,
                   seed=777, use_ortools=False, ortools_time=10, max_moves=5000):
     """Evaluate model on TSP-N instances."""
-    all_moves = enumerate_2opt(N)
-    M_total = len(all_moves)
-    # Subsample moves for large N (O(N²) → O(max_moves))
-    if M_total > max_moves:
-        subsample = True
-        print(f"  (subsampling {max_moves}/{M_total} moves per step for speed)")
-    else:
-        subsample = False
-        max_moves = M_total
+    k = get_sparse_factor(N)
+    use_knn = N > 80  # k-NN for large N, full for small
+
+    if use_knn:
+        print(f"  (k-NN moves: k={k}, ~{N*k} moves/step instead of {N*(N-3)//2})")
 
     model.eval()
     results = []
@@ -91,14 +88,16 @@ def evaluate_size(model, N, n_instances, n_steps, device, n_trajectories=1,
             for step in range(n_steps):
                 progress = step / max(n_steps - 1, 1)
 
-                # Subsample moves for large N
-                if subsample:
-                    indices = np.random.choice(M_total, max_moves, replace=False)
-                    moves_subset = [all_moves[i] for i in indices]
+                # k-NN restricted moves (O(N·k)) or full moves (O(N²))
+                if use_knn:
+                    moves_list = enumerate_2opt_knn(tour_np, coords, k=k)
                 else:
-                    moves_subset = all_moves
+                    moves_list = enumerate_2opt(N)
 
-                moves_ij = torch.tensor(moves_subset, dtype=torch.long, device=device)
+                if len(moves_list) == 0:
+                    break
+
+                moves_ij = torch.tensor(moves_list, dtype=torch.long, device=device)
                 tour_t = torch.tensor(tour_np, dtype=torch.long, device=device).unsqueeze(0)
                 t_tensor = torch.tensor([progress], device=device)
 
@@ -110,7 +109,7 @@ def evaluate_size(model, N, n_instances, n_steps, device, n_trajectories=1,
                 else:
                     idx = scores.argmax(dim=-1).item()
 
-                i, j = moves_subset[idx]
+                i, j = moves_list[idx]
                 d = delta_2opt(tour_np, i, j, dist)
                 if d < 0:
                     tour_np = apply_2opt(tour_np, i, j)
