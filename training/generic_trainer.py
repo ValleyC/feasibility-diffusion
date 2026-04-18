@@ -330,13 +330,70 @@ def stochastic_denoise(model, config, manifold, instance, max_moves, n_steps,
 @torch.no_grad()
 def best_of_k_denoise(model, config, manifold, instance, max_moves, n_steps,
                       device, K=8, temperature=0.5):
-    """Run K stochastic samples, return the best."""
+    """Run K stochastic trajectories in parallel (batched GPU forward pass)."""
+    model.eval()
+    sols = [manifold.sample_random(instance) for _ in range(K)]
+
+    for step in range(n_steps):
+        t_val = 1.0 - step / max(n_steps - 1, 1)
+        temp = max(temperature * t_val, 0.05)
+
+        # Build batch of K items
+        batch_nf, batch_ei, batch_mn, batch_mm = [], [], [], []
+        all_moves = []
+        max_edges = 0
+
+        for k in range(K):
+            moves = manifold.enumerate_moves(sols[k], instance)
+            if not moves:
+                all_moves.append([])
+                continue
+            if len(moves) > max_moves:
+                subset = np.random.choice(len(moves), max_moves, replace=False)
+                moves = [moves[i] for i in subset]
+            all_moves.append(moves)
+
+            nf, ei, mn, mm, _ = prepare_batch_item(
+                config, sols[k], instance, moves, 0, t_val, max_moves
+            )
+            batch_nf.append(nf)
+            batch_ei.append(ei)
+            batch_mn.append(mn)
+            batch_mm.append(mm)
+            max_edges = max(max_edges, ei.shape[0])
+
+        if not batch_nf:
+            break
+
+        # Pad edges and stack
+        for i in range(len(batch_ei)):
+            if batch_ei[i].shape[0] < max_edges:
+                pad = np.zeros((max_edges - batch_ei[i].shape[0], 2), dtype=np.int64)
+                batch_ei[i] = np.vstack([batch_ei[i], pad])
+
+        nf_t = torch.tensor(np.stack(batch_nf), dtype=torch.float32, device=device)
+        ei_t = torch.tensor(np.stack(batch_ei), dtype=torch.long, device=device)
+        mn_t = torch.tensor(np.stack(batch_mn), dtype=torch.long, device=device)
+        mm_t = torch.tensor(np.stack(batch_mm), dtype=torch.bool, device=device)
+        t_t = torch.full((len(batch_nf),), t_val, dtype=torch.float32, device=device)
+
+        scores = model(nf_t, ei_t, mn_t, mm_t, t_t)
+
+        # Each trajectory samples independently
+        for k in range(K):
+            if not all_moves[k]:
+                continue
+            n_moves = len(all_moves[k])
+            probs = F.softmax(scores[k, :n_moves] / temp, dim=-1)
+            best = torch.multinomial(probs, 1).item()
+            if best < n_moves:
+                d = manifold.move_delta(sols[k], all_moves[k][best], instance)
+                if d < 0:
+                    sols[k] = manifold.apply_move(sols[k], all_moves[k][best])
+
     best_sol, best_cost = None, float('inf')
-    for _ in range(K):
-        sol, cost = stochastic_denoise(
-            model, config, manifold, instance, max_moves, n_steps,
-            device, temperature
-        )
+    for sol in sols:
+        cost = manifold.cost(sol, instance)
         if cost < best_cost:
             best_cost = cost
             best_sol = sol
