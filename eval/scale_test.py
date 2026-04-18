@@ -29,13 +29,41 @@ from problems.tsp.tour import (
 from problems.tsp.data import generate_instance, solve_2opt
 from models.move_scorer import MoveScorer
 
+import torch.nn.functional as F
+
+
+def solve_ortools(coords, time_limit_s=10):
+    """Solve TSP via OR-Tools (near-optimal reference)."""
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+    N = len(coords)
+    SCALE = 10_000
+    dist = (np.sqrt(((coords[:, None] - coords[None]) ** 2).sum(-1)) * SCALE).astype(np.int64)
+    mgr = pywrapcp.RoutingIndexManager(N, 1, 0)
+    routing = pywrapcp.RoutingModel(mgr)
+    def cb(i, j):
+        return int(dist[mgr.IndexToNode(i), mgr.IndexToNode(j)])
+    routing.SetArcCostEvaluatorOfAllVehicles(routing.RegisterTransitCallback(cb))
+    p = pywrapcp.DefaultRoutingSearchParameters()
+    p.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    p.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    p.time_limit.FromSeconds(time_limit_s)
+    sol = routing.SolveWithParameters(p)
+    return sol.ObjectiveValue() / SCALE if sol else None
+
 
 @torch.no_grad()
-def evaluate_size(model, N, n_instances, n_steps, device, n_trajectories=1, seed=777):
-    """Evaluate model on TSP-N instances (model may have been trained on different N)."""
-    moves_list = enumerate_2opt(N)
-    M = len(moves_list)
-    moves_ij = torch.tensor(moves_list, dtype=torch.long, device=device)
+def evaluate_size(model, N, n_instances, n_steps, device, n_trajectories=1,
+                  seed=777, use_ortools=False, ortools_time=10, max_moves=5000):
+    """Evaluate model on TSP-N instances."""
+    all_moves = enumerate_2opt(N)
+    M_total = len(all_moves)
+    # Subsample moves for large N (O(N²) → O(max_moves))
+    if M_total > max_moves:
+        subsample = True
+        print(f"  (subsampling {max_moves}/{M_total} moves per step for speed)")
+    else:
+        subsample = False
+        max_moves = M_total
 
     model.eval()
     results = []
@@ -45,32 +73,44 @@ def evaluate_size(model, N, n_instances, n_steps, device, n_trajectories=1, seed
         coords = generate_instance(N, seed=seed + inst_id)
         dist = dist_matrix_from_coords(coords)
 
-        # Reference: multi-start 2-opt
-        ref_tour, ref_cost = solve_2opt(coords, max_restarts=min(5, N))
+        # Reference
+        if use_ortools:
+            ref_cost = solve_ortools(coords, time_limit_s=ortools_time)
+            if ref_cost is None:
+                _, ref_cost = solve_2opt(coords, max_restarts=min(5, N))
+        else:
+            _, ref_cost = solve_2opt(coords, max_restarts=min(5, N))
 
-        # Our model: greedy denoising (best of K trajectories)
+        # Our model: denoising (best of K trajectories)
         best_cost = float('inf')
+        coords_t = torch.tensor(coords, dtype=torch.float32, device=device).unsqueeze(0)
+
         for traj in range(n_trajectories):
             tour_np = random_tour(N)
-            coords_t = torch.tensor(coords, dtype=torch.float32, device=device).unsqueeze(0)
 
             for step in range(n_steps):
                 progress = step / max(n_steps - 1, 1)
+
+                # Subsample moves for large N
+                if subsample:
+                    indices = np.random.choice(M_total, max_moves, replace=False)
+                    moves_subset = [all_moves[i] for i in indices]
+                else:
+                    moves_subset = all_moves
+
+                moves_ij = torch.tensor(moves_subset, dtype=torch.long, device=device)
                 tour_t = torch.tensor(tour_np, dtype=torch.long, device=device).unsqueeze(0)
                 t_tensor = torch.tensor([progress], device=device)
 
                 scores = model(coords_t, tour_t, t_tensor, 1.0, moves_ij)
 
                 if n_trajectories > 1 and progress < 0.7:
-                    # Stochastic sampling for diversity (early steps)
-                    import torch.nn.functional as F
                     probs = F.softmax(scores.squeeze(0) / 0.5, dim=-1)
                     idx = torch.multinomial(probs, 1).item()
                 else:
-                    # Greedy (late steps or single trajectory)
                     idx = scores.argmax(dim=-1).item()
 
-                i, j = moves_list[idx]
+                i, j = moves_subset[idx]
                 d = delta_2opt(tour_np, i, j, dist)
                 if d < 0:
                     tour_np = apply_2opt(tour_np, i, j)
@@ -111,10 +151,14 @@ def main(args):
 
     for N in args.sizes:
         n_steps = max(N * 3, args.n_steps)
+        ortools_time = max(1, N // 20)  # scale time limit with N
         t0 = time.time()
         results = evaluate_size(
             model, N, args.n_instances, n_steps, device,
             n_trajectories=args.n_trajectories,
+            use_ortools=args.use_ortools,
+            ortools_time=ortools_time,
+            max_moves=args.max_moves,
         )
         elapsed = time.time() - t0
 
@@ -136,5 +180,9 @@ if __name__ == '__main__':
     parser.add_argument('--n_steps', type=int, default=150)
     parser.add_argument('--n_trajectories', type=int, default=1)
     parser.add_argument('--device', type=str, default='cpu')
+    parser.add_argument('--use_ortools', action='store_true',
+                        help='Use OR-Tools as reference (near-optimal) instead of 2-opt')
+    parser.add_argument('--max_moves', type=int, default=5000,
+                        help='Max moves to score per step (subsample for large N)')
     args = parser.parse_args()
     main(args)
