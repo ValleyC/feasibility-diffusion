@@ -100,8 +100,13 @@ def _process_one_instance(args):
 
     samples = []  # lightweight: (idx, solution, best_move, iteration)
     best_cost = float('inf')
+    time_limit = 120  # seconds per instance — prevents hangs on outliers
+    t_start = time.time()
 
     for restart in range(n_restarts):
+        if time.time() - t_start > time_limit:
+            break
+
         sol = manifold.sample_random(inst)
 
         moves_init = manifold.enumerate_moves(sol, inst)
@@ -113,6 +118,8 @@ def _process_one_instance(args):
             sol = manifold.apply_move(sol, mv[np.random.randint(len(mv))])
 
         for iteration in range(max_iters):
+            if time.time() - t_start > time_limit:
+                break
             moves = manifold.enumerate_moves(sol, inst)
             if len(moves) == 0 or len(moves) > max_moves:
                 break
@@ -120,7 +127,6 @@ def _process_one_instance(args):
             best_move_idx = int(np.argmin(deltas))
             if deltas[best_move_idx] >= -1e-10:
                 break
-            # Store lightweight: just the solution and best move (not full moves list)
             best_move = moves[best_move_idx]
             samples.append((idx, sol.copy() if hasattr(sol, 'copy') else sol,
                            best_move, iteration))
@@ -132,7 +138,7 @@ def _process_one_instance(args):
     return samples, best_cost
 
 
-def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
+def build_sample_pool(config, manifold, instances, max_moves, max_iters=100,
                       n_restarts=3, n_workers=None):
     """Build training samples from greedy improvement trajectories.
 
@@ -172,7 +178,7 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
               f"{n_workers} workers")
         with mp.Pool(n_workers) as p:
             for samples, cost in tqdm(
-                p.imap(_process_one_instance, work_args, chunksize=4),
+                p.imap(_process_one_instance, work_args, chunksize=1),
                 total=len(instances),
                 desc="  Pool generation",
             ):
