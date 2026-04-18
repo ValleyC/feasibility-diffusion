@@ -145,7 +145,7 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=100,
     Uses multiprocessing for parallel generation across instances.
     """
     if n_workers is None:
-        n_workers = min(cpu_count(), 64)
+        n_workers = min(cpu_count(), 32)
 
     # For multiprocessing: pass manifold CLASS (not instance) to avoid pickle issues
     # Each worker creates a fresh manifold with built-in 2-opt (no GPU sub_solver)
@@ -178,7 +178,7 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=100,
               f"{n_workers} workers")
         with mp.Pool(n_workers) as p:
             for samples, cost in tqdm(
-                p.imap(_process_one_instance, work_args, chunksize=1),
+                p.imap_unordered(_process_one_instance, work_args, chunksize=1),
                 total=len(instances),
                 desc="  Pool generation",
             ):
