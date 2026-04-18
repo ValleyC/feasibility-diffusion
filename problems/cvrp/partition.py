@@ -182,7 +182,7 @@ def partition_cost(assign: np.ndarray, coords: np.ndarray,
         sub_dist = dist[np.ix_(nodes, nodes)]
 
         if sub_tsp_solver is not None:
-            sub_cost = sub_tsp_solver(coords[nodes], sub_dist)
+            sub_cost = sub_tsp_solver(coords[nodes])
         else:
             sub_cost = _solve_sub_tsp_2opt(sub_dist)
 
