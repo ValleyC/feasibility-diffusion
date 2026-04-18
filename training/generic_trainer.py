@@ -177,7 +177,7 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
             ):
                 sample_pool.extend(samples)
                 costs.append(cost)
-                if (i + 1) % max(1, n_total // 20) == 0 or i == n_total - 1:
+                if True:  # print every instance for real-time monitoring
                     elapsed = time.time() - t_start
                     rate = (i + 1) / elapsed
                     eta = (n_total - i - 1) / rate if rate > 0 else 0
