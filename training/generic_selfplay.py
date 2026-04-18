@@ -190,8 +190,15 @@ def train(args):
                     total = max(len([p for p in pool if p[0] == inst_idx]) - 1, 1)
                     progress = step_i / total
 
+                    moves = manifold.enumerate_moves(sol, instances[inst_idx])
+                    best_idx = 0
+                    for mi, m in enumerate(moves):
+                        if m == best_move:
+                            best_idx = mi
+                            break
+
                     nf, ei, mn, mm, label = prepare_batch_item(
-                        config, manifold, sol, instances[inst_idx], best_move,
+                        config, sol, instances[inst_idx], moves, best_idx,
                         progress, args.max_moves
                     )
                     items.append((nf, ei, mn, mm, label))

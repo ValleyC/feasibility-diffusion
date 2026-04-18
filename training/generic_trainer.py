@@ -166,54 +166,36 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
             costs.append(cost)
             pbar.set_postfix(samples=len(sample_pool), cost=f"{cost:.2f}")
     else:
-        # Parallel — use print() for progress (tqdm doesn't flush under nohup)
-        n_total = len(instances)
-        print(f"  Pool generation: {n_total} instances × {n_restarts} restarts, "
-              f"{n_workers} workers", flush=True)
-        t_start = time.time()
+        # Parallel — process results as they arrive (not collected into list)
+        # to avoid pipe backpressure that causes BrokenPipeError
+        print(f"  Pool generation: {len(instances)} instances × {n_restarts} restarts, "
+              f"{n_workers} workers")
         with mp.Pool(n_workers) as p:
-            for i, (samples, cost) in enumerate(
-                p.imap(_process_one_instance, work_args, chunksize=1)
+            for samples, cost in tqdm(
+                p.imap(_process_one_instance, work_args, chunksize=4),
+                total=len(instances),
+                desc="  Pool generation",
             ):
                 sample_pool.extend(samples)
                 costs.append(cost)
-                if True:  # print every instance for real-time monitoring
-                    elapsed = time.time() - t_start
-                    rate = (i + 1) / elapsed
-                    eta = (n_total - i - 1) / rate if rate > 0 else 0
-                    print(f"  [{i+1}/{n_total}] {len(sample_pool)} samples, "
-                          f"avg cost={np.mean(costs):.4f}, "
-                          f"{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining",
-                          flush=True)
 
     return sample_pool, costs
 
 
-def prepare_batch_item(config, manifold, solution, instance, best_move,
-                       progress, max_moves):
-    """Prepare tensors for one training sample.
-
-    Re-enumerates moves from the solution (not stored in pool to save memory).
-    Finds the index of best_move in the enumerated list → label.
-    """
+def prepare_batch_item(config, solution, instance, moves, best_idx, progress, max_moves):
+    """Prepare tensors for one training sample."""
     node_features = config.build_node_features(solution, instance, progress)
     edge_index = config.build_edges(solution, instance)
-
-    # Re-enumerate moves from solution state
-    moves = manifold.enumerate_moves(solution, instance)
 
     move_nodes = np.zeros((max_moves, 4), dtype=np.int64)
     move_mask = np.zeros(max_moves, dtype=bool)
 
-    # Find index of the stored best_move in the enumerated list
-    label = 0
     for i, m in enumerate(moves[:max_moves]):
         a, b, c, d = config.move_to_4nodes(solution, m, instance)
         move_nodes[i] = [a, b, c, d]
         move_mask[i] = True
-        if m == best_move:
-            label = i
 
+    label = min(best_idx, max_moves - 1)
     return node_features, edge_index, move_nodes, move_mask, label
 
 
@@ -229,9 +211,10 @@ def greedy_denoise(model, config, manifold, instance, max_moves, n_steps, device
         if len(moves) == 0 or len(moves) > max_moves:
             break
 
+        n_total = len([m for m in range(len(moves))])
         progress = step / max(n_steps - 1, 1)
         nf, ei, mn, mm, _ = prepare_batch_item(
-            config, manifold, sol, instance, None, progress, max_moves
+            config, sol, instance, moves, 0, progress, max_moves
         )
 
         nf_t = torch.tensor(nf, dtype=torch.float32, device=device).unsqueeze(0)
@@ -311,8 +294,17 @@ def train(args):
                 )
                 progress = step_i / total_steps
 
+                # Re-enumerate moves from solution (lightweight pool doesn't store them)
+                moves = manifold.enumerate_moves(sol, instances[inst_idx])
+                # Find index of the stored best_move
+                best_idx = 0
+                for mi, m in enumerate(moves):
+                    if m == best_move:
+                        best_idx = mi
+                        break
+
                 nf, ei, mn, mm, label = prepare_batch_item(
-                    config, manifold, sol, instances[inst_idx], best_move,
+                    config, sol, instances[inst_idx], moves, best_idx,
                     progress, args.max_moves
                 )
                 items.append((nf, ei, mn, mm, label))
