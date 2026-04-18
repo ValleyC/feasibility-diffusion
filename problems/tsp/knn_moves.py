@@ -5,7 +5,7 @@ Instead of enumerating all N(N-3)/2 2-opt moves (O(N²)), restrict to
 moves where the boundary nodes are spatial nearest neighbors. This
 captures >99% of improving moves since 2-opt improvements are local.
 
-Matches EDISCO's sparse_factor convention:
+Standard sparse_factor convention:
   TSP-50:    k=50  (full, since N(N-3)/2 = 1175)
   TSP-100:   k=50
   TSP-500:   k=50
@@ -19,13 +19,13 @@ import numpy as np
 from typing import List, Tuple
 
 
-# Match EDISCO's sparse_factor settings
+# Match standard sparse_factor settings
 SPARSE_FACTOR = {50: 50, 100: 50, 200: 50, 500: 50, 1000: 100, 2000: 100,
                  5000: 100, 10000: 100}
 
 
 def get_sparse_factor(N: int) -> int:
-    """Get k for k-NN move restriction, matching EDISCO."""
+    """Get k for k-NN move restriction."""
     if N in SPARSE_FACTOR:
         return SPARSE_FACTOR[N]
     if N <= 100:
@@ -61,7 +61,7 @@ def enumerate_2opt_knn(tour: np.ndarray, coords: np.ndarray,
     Args:
         tour: (N,) current tour permutation
         coords: (N, 2) node coordinates
-        k: number of nearest neighbors (default: EDISCO's setting for N)
+        k: number of nearest neighbors (default: standard setting for N)
 
     Returns:
         List of (i, j) tour-position pairs for valid 2-opt moves.
