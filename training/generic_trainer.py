@@ -139,7 +139,7 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
     Uses multiprocessing for parallel generation across instances.
     """
     if n_workers is None:
-        n_workers = min(cpu_count(), 64)
+        n_workers = 1  # default serial — safe across all platforms
 
     # For multiprocessing: pass manifold CLASS (not instance) to avoid pickle issues
     # Each worker creates a fresh manifold with built-in 2-opt (no GPU sub_solver)
