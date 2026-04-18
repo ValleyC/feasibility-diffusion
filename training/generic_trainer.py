@@ -26,7 +26,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from multiprocessing import Pool, cpu_count
+import multiprocessing as mp
+from multiprocessing import cpu_count
 
 from models.problem_configs import PROBLEM_CONFIGS
 
@@ -162,11 +163,12 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
             costs.append(cost)
             pbar.set_postfix(samples=len(sample_pool), cost=f"{cost:.2f}")
     else:
-        # Parallel — workers create fresh manifolds (no GPU dependencies)
+        # Parallel — use 'spawn' context to avoid fork issues with CUDA/imports
         print(f"  Pool generation: {len(instances)} instances × {n_restarts} restarts, "
-              f"{n_workers} workers")
+              f"{n_workers} workers (spawn)")
         chunk = max(1, len(instances) // (n_workers * 4))
-        with Pool(n_workers) as p:
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(n_workers) as p:
             results = list(tqdm(
                 p.imap(_process_one_instance, work_args, chunksize=chunk),
                 total=len(instances),
