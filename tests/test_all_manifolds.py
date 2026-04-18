@@ -188,8 +188,33 @@ def make_spctsp():
     }
 
 
+def make_cvrptw():
+    from problems.cvrptw.manifold import CVRPTWManifold
+    N = 10  # smaller — TW feasibility check is expensive
+    np.random.seed(13)
+    coords = np.random.rand(N + 1, 2).astype(np.float32)
+    demands = np.zeros(N + 1, dtype=np.float32)
+    demands[1:] = np.random.randint(1, 5, N).astype(np.float32)  # lighter demands
+    dist = dist_matrix_from_coords(coords)
+    horizon = 5.0
+    tw_early = np.zeros(N + 1, dtype=np.float32)
+    tw_late = np.full(N + 1, horizon, dtype=np.float32)
+    service_time = np.zeros(N + 1, dtype=np.float32)
+    service_time[1:] = 0.1
+    for c in range(1, N + 1):
+        center = np.random.uniform(0.5, horizon - 0.5)
+        width = np.random.uniform(1.0, 2.0)  # wider windows for feasibility
+        tw_early[c] = max(0, center - width / 2)
+        tw_late[c] = min(horizon, center + width / 2)
+    return "CVRPTW", CVRPTWManifold(), {
+        'coords': coords, 'demands': demands, 'capacity': 20.0,
+        'dist': dist, 'n_customers': N,
+        'tw_early': tw_early, 'tw_late': tw_late, 'service_time': service_time,
+    }
+
+
 if __name__ == '__main__':
-    problems = [make_tsp(), make_atsp(), make_cvrp(), make_ovrp(),
+    problems = [make_tsp(), make_atsp(), make_cvrp(), make_cvrptw(), make_ovrp(),
                 make_pctsp(), make_spctsp(), make_op(),
                 make_kp(), make_mis(), make_mtsp()]
 

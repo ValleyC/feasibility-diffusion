@@ -481,12 +481,71 @@ class SPCTSPConfig(PCTSPConfig):
         return feats
 
 
+# ─── CVRPTW ──────────────────────────────────────────────────
+
+class CVRPTWConfig(CVRPConfig):
+    name = "CVRPTW"
+    n_node_features = 9  # x, y, demand/cap, vehicle/K, tw_early, tw_late, service, is_depot, progress
+
+    def create_instance(self, N, seed):
+        np.random.seed(seed)
+        coords = np.random.rand(N + 1, 2).astype(np.float32)
+        demands = np.zeros(N + 1, dtype=np.float32)
+        demands[1:] = np.random.randint(1, 10, N).astype(np.float32)
+        cap = {10: 20, 20: 30, 50: 40, 100: 50}.get(N, 50)
+        dist = dist_matrix_from_coords(coords)
+
+        # Time windows: depot [0, horizon], customers within horizon
+        horizon = 5.0
+        tw_early = np.zeros(N + 1, dtype=np.float32)
+        tw_late = np.full(N + 1, horizon, dtype=np.float32)
+        service_time = np.zeros(N + 1, dtype=np.float32)
+        service_time[1:] = 0.1
+
+        for c in range(1, N + 1):
+            # Random window within [0, horizon]
+            center = np.random.uniform(0.5, horizon - 0.5)
+            width = np.random.uniform(0.5, 1.5)
+            tw_early[c] = max(0, center - width / 2)
+            tw_late[c] = min(horizon, center + width / 2)
+
+        return {
+            'coords': coords, 'demands': demands, 'capacity': float(cap),
+            'dist': dist, 'n_customers': N,
+            'tw_early': tw_early, 'tw_late': tw_late, 'service_time': service_time,
+        }
+
+    def create_manifold(self):
+        from problems.cvrptw.manifold import CVRPTWManifold
+        return CVRPTWManifold()
+
+    def build_node_features(self, solution, instance, progress):
+        N = instance['n_customers']
+        coords = instance['coords']
+        demands = instance['demands']
+        cap = instance['capacity']
+        K = max(solution[1:].max() + 1, 1)
+        horizon = instance['tw_late'][0]
+
+        feats = np.zeros((N + 1, 9), dtype=np.float32)
+        feats[:, 0:2] = coords
+        feats[:, 2] = demands / cap
+        feats[:, 3] = np.where(solution >= 0, solution / K, 0)
+        feats[:, 4] = instance['tw_early'] / horizon
+        feats[:, 5] = instance['tw_late'] / horizon
+        feats[:, 6] = instance['service_time']
+        feats[0, 7] = 1.0  # is_depot
+        feats[:, 8] = progress
+        return feats
+
+
 # ─── Registry ────────────────────────────────────────────────
 
 PROBLEM_CONFIGS = {
     'tsp': TSPConfig,
     'atsp': ATSPConfig,
     'cvrp': CVRPConfig,
+    'cvrptw': CVRPTWConfig,
     'ovrp': OVRPConfig,
     'pctsp': PCTSPConfig,
     'spctsp': SPCTSPConfig,
