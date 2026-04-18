@@ -87,18 +87,18 @@ class GenericMoveScorer(nn.Module):
 def _process_one_instance(args):
     """Process a single instance (for multiprocessing).
 
-    Creates a fresh manifold per worker to avoid pickle issues with
-    GPU-based sub_solvers (which can't cross process boundaries).
+    Returns LIGHTWEIGHT samples: (idx, solution_copy, best_move, iteration).
+    Does NOT return the full moves list (too large for pipe serialization).
+    Moves are re-enumerated during batch preparation.
     """
     idx, inst, manifold_class, max_moves, max_iters, n_restarts = args
 
-    # Create a fresh manifold (no sub_solver — use built-in 2-opt)
     if isinstance(manifold_class, type):
         manifold = manifold_class()
     else:
-        manifold = manifold_class  # already an instance (serial mode)
+        manifold = manifold_class
 
-    samples = []
+    samples = []  # lightweight: (idx, solution, best_move, iteration)
     best_cost = float('inf')
 
     for restart in range(n_restarts):
@@ -120,8 +120,11 @@ def _process_one_instance(args):
             best_move_idx = int(np.argmin(deltas))
             if deltas[best_move_idx] >= -1e-10:
                 break
-            samples.append((idx, sol, moves, best_move_idx, iteration))
-            sol = manifold.apply_move(sol, moves[best_move_idx])
+            # Store lightweight: just the solution and best move (not full moves list)
+            best_move = moves[best_move_idx]
+            samples.append((idx, sol.copy() if hasattr(sol, 'copy') else sol,
+                           best_move, iteration))
+            sol = manifold.apply_move(sol, best_move)
 
         c = manifold.cost(sol, inst)
         best_cost = min(best_cost, c)
@@ -179,23 +182,32 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
 
     return sample_pool, costs
 
-    return pool, costs
 
+def prepare_batch_item(config, manifold, solution, instance, best_move,
+                       progress, max_moves):
+    """Prepare tensors for one training sample.
 
-def prepare_batch_item(config, solution, instance, moves, best_idx, progress, max_moves):
-    """Prepare tensors for one training sample."""
+    Re-enumerates moves from the solution (not stored in pool to save memory).
+    Finds the index of best_move in the enumerated list → label.
+    """
     node_features = config.build_node_features(solution, instance, progress)
     edge_index = config.build_edges(solution, instance)
+
+    # Re-enumerate moves from solution state
+    moves = manifold.enumerate_moves(solution, instance)
 
     move_nodes = np.zeros((max_moves, 4), dtype=np.int64)
     move_mask = np.zeros(max_moves, dtype=bool)
 
+    # Find index of the stored best_move in the enumerated list
+    label = 0
     for i, m in enumerate(moves[:max_moves]):
         a, b, c, d = config.move_to_4nodes(solution, m, instance)
         move_nodes[i] = [a, b, c, d]
         move_mask[i] = True
+        if m == best_move:
+            label = i
 
-    label = min(best_idx, max_moves - 1)
     return node_features, edge_index, move_nodes, move_mask, label
 
 
@@ -211,10 +223,9 @@ def greedy_denoise(model, config, manifold, instance, max_moves, n_steps, device
         if len(moves) == 0 or len(moves) > max_moves:
             break
 
-        n_total = len([m for m in range(len(moves))])
         progress = step / max(n_steps - 1, 1)
         nf, ei, mn, mm, _ = prepare_batch_item(
-            config, sol, instance, moves, 0, progress, max_moves
+            config, manifold, sol, instance, None, progress, max_moves
         )
 
         nf_t = torch.tensor(nf, dtype=torch.float32, device=device).unsqueeze(0)
@@ -288,14 +299,14 @@ def train(args):
             items = []
             for _ in range(args.batch_size):
                 s_idx = np.random.randint(n_pool)
-                inst_idx, sol, moves, best_idx, step_i = pool[s_idx]
+                inst_idx, sol, best_move, step_i = pool[s_idx]
                 total_steps = max(
                     len([p for p in pool if p[0] == inst_idx]) - 1, 1
                 )
                 progress = step_i / total_steps
 
                 nf, ei, mn, mm, label = prepare_batch_item(
-                    config, sol, instances[inst_idx], moves, best_idx,
+                    config, manifold, sol, instances[inst_idx], best_move,
                     progress, args.max_moves
                 )
                 items.append((nf, ei, mn, mm, label))

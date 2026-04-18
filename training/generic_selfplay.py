@@ -186,12 +186,12 @@ def train(args):
                 items = []
                 for _ in range(args.batch_size):
                     s_idx = np.random.randint(n_pool)
-                    inst_idx, sol, moves, best_idx, step_i = pool[s_idx]
+                    inst_idx, sol, best_move, step_i = pool[s_idx]
                     total = max(len([p for p in pool if p[0] == inst_idx]) - 1, 1)
                     progress = step_i / total
 
                     nf, ei, mn, mm, label = prepare_batch_item(
-                        config, sol, instances[inst_idx], moves, best_idx,
+                        config, manifold, sol, instances[inst_idx], best_move,
                         progress, args.max_moves
                     )
                     items.append((nf, ei, mn, mm, label))
