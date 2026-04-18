@@ -139,7 +139,7 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
     Uses multiprocessing for parallel generation across instances.
     """
     if n_workers is None:
-        n_workers = 1  # default serial — safe across all platforms
+        n_workers = min(cpu_count(), 64)
 
     # For multiprocessing: pass manifold CLASS (not instance) to avoid pickle issues
     # Each worker creates a fresh manifold with built-in 2-opt (no GPU sub_solver)
@@ -166,19 +166,25 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
             costs.append(cost)
             pbar.set_postfix(samples=len(sample_pool), cost=f"{cost:.2f}")
     else:
-        # Parallel — fork is 3x faster than spawn (verified by diagnostics)
-        # chunksize=1 so progress bar updates per instance (not per chunk)
-        print(f"  Pool generation: {len(instances)} instances × {n_restarts} restarts, "
-              f"{n_workers} workers")
+        # Parallel — use print() for progress (tqdm doesn't flush under nohup)
+        n_total = len(instances)
+        print(f"  Pool generation: {n_total} instances × {n_restarts} restarts, "
+              f"{n_workers} workers", flush=True)
+        t_start = time.time()
         with mp.Pool(n_workers) as p:
-            results = list(tqdm(
-                p.imap(_process_one_instance, work_args, chunksize=1),
-                total=len(instances),
-                desc="  Pool generation",
-            ))
-        for samples, cost in results:
-            sample_pool.extend(samples)
-            costs.append(cost)
+            for i, (samples, cost) in enumerate(
+                p.imap(_process_one_instance, work_args, chunksize=1)
+            ):
+                sample_pool.extend(samples)
+                costs.append(cost)
+                if (i + 1) % max(1, n_total // 20) == 0 or i == n_total - 1:
+                    elapsed = time.time() - t_start
+                    rate = (i + 1) / elapsed
+                    eta = (n_total - i - 1) / rate if rate > 0 else 0
+                    print(f"  [{i+1}/{n_total}] {len(sample_pool)} samples, "
+                          f"avg cost={np.mean(costs):.4f}, "
+                          f"{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining",
+                          flush=True)
 
     return sample_pool, costs
 
