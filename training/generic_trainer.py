@@ -163,14 +163,13 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
             costs.append(cost)
             pbar.set_postfix(samples=len(sample_pool), cost=f"{cost:.2f}")
     else:
-        # Parallel — use 'spawn' context to avoid fork issues with CUDA/imports
+        # Parallel — fork is 3x faster than spawn (verified by diagnostics)
+        # chunksize=1 so progress bar updates per instance (not per chunk)
         print(f"  Pool generation: {len(instances)} instances × {n_restarts} restarts, "
-              f"{n_workers} workers (spawn)")
-        chunk = max(1, len(instances) // (n_workers * 4))
-        ctx = mp.get_context('spawn')
-        with ctx.Pool(n_workers) as p:
+              f"{n_workers} workers")
+        with mp.Pool(n_workers) as p:
             results = list(tqdm(
-                p.imap(_process_one_instance, work_args, chunksize=chunk),
+                p.imap(_process_one_instance, work_args, chunksize=1),
                 total=len(instances),
                 desc="  Pool generation",
             ))
