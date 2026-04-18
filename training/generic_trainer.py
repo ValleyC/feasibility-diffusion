@@ -84,8 +84,18 @@ class GenericMoveScorer(nn.Module):
 # ─── Data generation ─────────────────────────────────────────
 
 def _process_one_instance(args):
-    """Process a single instance (for multiprocessing)."""
-    idx, inst, manifold, max_moves, max_iters, n_restarts = args
+    """Process a single instance (for multiprocessing).
+
+    Creates a fresh manifold per worker to avoid pickle issues with
+    GPU-based sub_solvers (which can't cross process boundaries).
+    """
+    idx, inst, manifold_class, max_moves, max_iters, n_restarts = args
+
+    # Create a fresh manifold (no sub_solver — use built-in 2-opt)
+    if isinstance(manifold_class, type):
+        manifold = manifold_class()
+    else:
+        manifold = manifold_class  # already an instance (serial mode)
 
     samples = []
     best_cost = float('inf')
@@ -125,37 +135,48 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
     Uses multiprocessing for parallel generation across instances.
     """
     if n_workers is None:
-        n_workers = min(cpu_count(), 16)
+        n_workers = min(cpu_count(), 64)
+
+    # For multiprocessing: pass manifold CLASS (not instance) to avoid pickle issues
+    # Each worker creates a fresh manifold with built-in 2-opt (no GPU sub_solver)
+    manifold_class = type(manifold)
 
     work_args = [
-        (idx, inst, manifold, max_moves, max_iters, n_restarts)
+        (idx, inst, manifold_class, max_moves, max_iters, n_restarts)
         for idx, inst in enumerate(instances)
     ]
 
-    pool = []
+    sample_pool = []
     costs = []
 
     if n_workers <= 1:
-        # Serial (for debugging)
-        pbar = tqdm(work_args, desc="  Pool generation")
+        # Serial — use the original manifold (may have sub_solver)
+        work_args_serial = [
+            (idx, inst, manifold, max_moves, max_iters, n_restarts)
+            for idx, inst in enumerate(instances)
+        ]
+        pbar = tqdm(work_args_serial, desc="  Pool generation")
         for args in pbar:
             samples, cost = _process_one_instance(args)
-            pool.extend(samples)
+            sample_pool.extend(samples)
             costs.append(cost)
-            pbar.set_postfix(samples=len(pool), cost=f"{cost:.2f}")
+            pbar.set_postfix(samples=len(sample_pool), cost=f"{cost:.2f}")
     else:
-        # Parallel
+        # Parallel — workers create fresh manifolds (no GPU dependencies)
         print(f"  Pool generation: {len(instances)} instances × {n_restarts} restarts, "
               f"{n_workers} workers")
+        chunk = max(1, len(instances) // (n_workers * 4))
         with Pool(n_workers) as p:
             results = list(tqdm(
-                p.imap(_process_one_instance, work_args, chunksize=max(1, len(instances) // (n_workers * 4))),
+                p.imap(_process_one_instance, work_args, chunksize=chunk),
                 total=len(instances),
                 desc="  Pool generation",
             ))
         for samples, cost in results:
-            pool.extend(samples)
+            sample_pool.extend(samples)
             costs.append(cost)
+
+    return sample_pool, costs
 
     return pool, costs
 
