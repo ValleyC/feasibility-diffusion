@@ -50,7 +50,7 @@ def evaluate_size(model, N, n_instances, n_steps, device, n_trajectories=1, seed
 
         # Our model: greedy denoising (best of K trajectories)
         best_cost = float('inf')
-        for _ in range(n_trajectories):
+        for traj in range(n_trajectories):
             tour_np = random_tour(N)
             coords_t = torch.tensor(coords, dtype=torch.float32, device=device).unsqueeze(0)
 
@@ -60,9 +60,17 @@ def evaluate_size(model, N, n_instances, n_steps, device, n_trajectories=1, seed
                 t_tensor = torch.tensor([progress], device=device)
 
                 scores = model(coords_t, tour_t, t_tensor, 1.0, moves_ij)
-                best_idx = scores.argmax(dim=-1).item()
-                i, j = moves_list[best_idx]
 
+                if n_trajectories > 1 and progress < 0.7:
+                    # Stochastic sampling for diversity (early steps)
+                    import torch.nn.functional as F
+                    probs = F.softmax(scores.squeeze(0) / 0.5, dim=-1)
+                    idx = torch.multinomial(probs, 1).item()
+                else:
+                    # Greedy (late steps or single trajectory)
+                    idx = scores.argmax(dim=-1).item()
+
+                i, j = moves_list[idx]
                 d = delta_2opt(tour_np, i, j, dist)
                 if d < 0:
                     tour_np = apply_2opt(tour_np, i, j)
