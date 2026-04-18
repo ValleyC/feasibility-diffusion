@@ -20,6 +20,7 @@ import argparse
 import time
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from problems.tsp.tour import (
     enumerate_2opt, apply_2opt, delta_2opt, tour_cost,
@@ -39,7 +40,8 @@ def evaluate_size(model, N, n_instances, n_steps, device, n_trajectories=1, seed
     model.eval()
     results = []
 
-    for inst_id in range(n_instances):
+    pbar = tqdm(range(n_instances), desc=f"TSP-{N}", leave=False)
+    for inst_id in pbar:
         coords = generate_instance(N, seed=seed + inst_id)
         dist = dist_matrix_from_coords(coords)
 
@@ -71,6 +73,7 @@ def evaluate_size(model, N, n_instances, n_steps, device, n_trajectories=1, seed
 
         gap = (best_cost / ref_cost - 1) * 100
         results.append({'ref': ref_cost, 'ours': best_cost, 'gap': gap})
+        pbar.set_postfix(gap=f"{gap:+.1f}%", cost=f"{best_cost:.2f}")
 
     return results
 
