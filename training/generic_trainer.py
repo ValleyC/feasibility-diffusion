@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
 
 from models.problem_configs import PROBLEM_CONFIGS
 
@@ -82,52 +83,79 @@ class GenericMoveScorer(nn.Module):
 
 # ─── Data generation ─────────────────────────────────────────
 
+def _process_one_instance(args):
+    """Process a single instance (for multiprocessing)."""
+    idx, inst, manifold, max_moves, max_iters, n_restarts = args
+
+    samples = []
+    best_cost = float('inf')
+
+    for restart in range(n_restarts):
+        sol = manifold.sample_random(inst)
+
+        moves_init = manifold.enumerate_moves(sol, inst)
+        n_degrade = np.random.randint(0, max(len(moves_init) // 3, 1) + 1)
+        for _ in range(n_degrade):
+            mv = manifold.enumerate_moves(sol, inst)
+            if len(mv) == 0:
+                break
+            sol = manifold.apply_move(sol, mv[np.random.randint(len(mv))])
+
+        for iteration in range(max_iters):
+            moves = manifold.enumerate_moves(sol, inst)
+            if len(moves) == 0 or len(moves) > max_moves:
+                break
+            deltas = np.array([manifold.move_delta(sol, m, inst) for m in moves])
+            best_move_idx = int(np.argmin(deltas))
+            if deltas[best_move_idx] >= -1e-10:
+                break
+            samples.append((idx, sol, moves, best_move_idx, iteration))
+            sol = manifold.apply_move(sol, moves[best_move_idx])
+
+        c = manifold.cost(sol, inst)
+        best_cost = min(best_cost, c)
+
+    return samples, best_cost
+
+
 def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
-                      n_restarts=3):
+                      n_restarts=3, n_workers=None):
     """Build training samples from greedy improvement trajectories.
 
-    Multiple restarts per instance ensure diverse coverage.
-    For problems where random init is already locally optimal (e.g., MIS),
-    we degrade the solution first to create room for improvement.
+    Uses multiprocessing for parallel generation across instances.
     """
+    if n_workers is None:
+        n_workers = min(cpu_count(), 16)
+
+    work_args = [
+        (idx, inst, manifold, max_moves, max_iters, n_restarts)
+        for idx, inst in enumerate(instances)
+    ]
+
     pool = []
     costs = []
 
-    pbar = tqdm(range(len(instances)), desc="  Pool generation")
-    for idx in pbar:
-        inst = instances[idx]
-        best_cost = float('inf')
-
-        for restart in range(n_restarts):
-            sol = manifold.sample_random(inst)
-
-            # Degrade: randomly apply some worsening moves to create
-            # sub-optimal starting points (enables improvement trajectory)
-            moves_init = manifold.enumerate_moves(sol, inst)
-            n_degrade = np.random.randint(0, max(len(moves_init) // 3, 1) + 1)
-            for _ in range(n_degrade):
-                mv = manifold.enumerate_moves(sol, inst)
-                if len(mv) == 0:
-                    break
-                sol = manifold.apply_move(sol, mv[np.random.randint(len(mv))])
-
-            # Greedy improvement from degraded state
-            for iteration in range(max_iters):
-                moves = manifold.enumerate_moves(sol, inst)
-                if len(moves) == 0 or len(moves) > max_moves:
-                    break
-                deltas = np.array([manifold.move_delta(sol, m, inst) for m in moves])
-                best_move_idx = int(np.argmin(deltas))
-                if deltas[best_move_idx] >= -1e-10:
-                    break
-                pool.append((idx, sol, moves, best_move_idx, iteration))
-                sol = manifold.apply_move(sol, moves[best_move_idx])
-
-            c = manifold.cost(sol, inst)
-            best_cost = min(best_cost, c)
-
-        costs.append(best_cost)
-        pbar.set_postfix(samples=len(pool), cost=f"{best_cost:.2f}")
+    if n_workers <= 1:
+        # Serial (for debugging)
+        pbar = tqdm(work_args, desc="  Pool generation")
+        for args in pbar:
+            samples, cost = _process_one_instance(args)
+            pool.extend(samples)
+            costs.append(cost)
+            pbar.set_postfix(samples=len(pool), cost=f"{cost:.2f}")
+    else:
+        # Parallel
+        print(f"  Pool generation: {len(instances)} instances × {n_restarts} restarts, "
+              f"{n_workers} workers")
+        with Pool(n_workers) as p:
+            results = list(tqdm(
+                p.imap(_process_one_instance, work_args, chunksize=max(1, len(instances) // (n_workers * 4))),
+                total=len(instances),
+                desc="  Pool generation",
+            ))
+        for samples, cost in results:
+            pool.extend(samples)
+            costs.append(cost)
 
     return pool, costs
 
