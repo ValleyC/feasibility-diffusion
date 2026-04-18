@@ -165,15 +165,16 @@ def train(args):
                     s_idx = np.random.randint(n_pool)
                     idx, sol, deltas, t = pool[s_idx]
 
-                    tau_t = tau_min + t * (tau_max - tau_min)
-                    target = boltzmann_target(deltas, tau_t)
-
                     moves = manifold.enumerate_moves(sol, instances[idx])
-                    if len(moves) != len(deltas):
+                    if len(moves) != len(deltas) or not moves:
                         continue
 
+                    n_use = min(len(moves), args.max_moves)
+                    tau_t = tau_min + t * (tau_max - tau_min)
+                    target = boltzmann_target(deltas[:n_use], tau_t)
+
                     nf, ei, mn, mm, _ = prepare_batch_item(
-                        config, sol, instances[idx], moves, 0, t, args.max_moves
+                        config, sol, instances[idx], moves[:n_use], 0, t, args.max_moves
                     )
                     items.append((nf, ei, mn, mm, target, t))
                     max_edges = max(max_edges, ei.shape[0])

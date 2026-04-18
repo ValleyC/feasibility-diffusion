@@ -135,16 +135,23 @@ def _process_one_instance(args):
             if time.time() - t_start > time_limit:
                 break
             moves = manifold.enumerate_moves(sol, inst)
-            if not moves or len(moves) > max_moves:
+            if not moves:
                 break
-            deltas = np.array([manifold.move_delta(sol, m, inst) for m in moves])
-            best = np.argmin(deltas)
-            if deltas[best] >= -1e-10:
+            # Subsample for greedy improvement only (finding best move)
+            if len(moves) > max_moves:
+                subset = np.random.choice(len(moves), max_moves, replace=False)
+                moves_sub = [moves[i] for i in subset]
+            else:
+                moves_sub = moves
+            deltas_sub = np.array([manifold.move_delta(sol, m, inst) for m in moves_sub])
+            best = np.argmin(deltas_sub)
+            if deltas_sub[best] >= -1e-10:
                 break
-            sol = manifold.apply_move(sol, moves[best])
+            sol = manifold.apply_move(sol, moves_sub[best])
 
+        # Compute deltas for ALL moves (training uses truncation at batch time)
         moves = manifold.enumerate_moves(sol, inst)
-        if not moves or len(moves) > max_moves:
+        if not moves:
             continue
 
         deltas = np.array([manifold.move_delta(sol, m, inst) for m in moves],
@@ -250,8 +257,11 @@ def greedy_denoise(model, config, manifold, instance, max_moves, n_steps, device
 
     for step in range(n_steps):
         moves = manifold.enumerate_moves(sol, instance)
-        if len(moves) == 0 or len(moves) > max_moves:
+        if not moves:
             break
+        if len(moves) > max_moves:
+            subset = np.random.choice(len(moves), max_moves, replace=False)
+            moves = [moves[i] for i in subset]
 
         t_val = 1.0 - step / max(n_steps - 1, 1)
         nf, ei, mn, mm, _ = prepare_batch_item(
@@ -285,8 +295,11 @@ def stochastic_denoise(model, config, manifold, instance, max_moves, n_steps,
 
     for step in range(n_steps):
         moves = manifold.enumerate_moves(sol, instance)
-        if len(moves) == 0 or len(moves) > max_moves:
+        if not moves:
             break
+        if len(moves) > max_moves:
+            subset = np.random.choice(len(moves), max_moves, replace=False)
+            moves = [moves[i] for i in subset]
 
         t_val = 1.0 - step / max(n_steps - 1, 1)
         temp = max(temperature * t_val, 0.05)
@@ -397,15 +410,17 @@ def train(args):
                 s_idx = np.random.randint(n_pool)
                 idx, sol, deltas, t = pool[s_idx]
 
-                tau_t = tau_min + t * (tau_max - tau_min)
-                target = boltzmann_target(deltas, tau_t)
-
                 moves = manifold.enumerate_moves(sol, instances[idx])
-                if len(moves) != len(deltas):
+                if len(moves) != len(deltas) or not moves:
                     continue
 
+                # Truncate to max_moves consistently
+                n_use = min(len(moves), args.max_moves)
+                tau_t = tau_min + t * (tau_max - tau_min)
+                target = boltzmann_target(deltas[:n_use], tau_t)
+
                 nf, ei, mn, mm, _ = prepare_batch_item(
-                    config, sol, instances[idx], moves, 0, t, args.max_moves
+                    config, sol, instances[idx], moves[:n_use], 0, t, args.max_moves
                 )
                 items.append((nf, ei, mn, mm, target, t))
                 max_edges = max(max_edges, ei.shape[0])
