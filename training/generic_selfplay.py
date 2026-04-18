@@ -119,7 +119,7 @@ def train(args):
     # Generate instances
     print(f"Generating {args.n_instances} instances...")
     instances = [config.create_instance(args.N, seed=42 + i)
-                 for i in range(args.n_instances)]
+                 for i in tqdm(range(args.n_instances), desc="  Instances")]
     val_instances = [config.create_instance(args.N, seed=99999 + i)
                      for i in range(args.n_val)]
 

@@ -93,7 +93,9 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
     pool = []
     costs = []
 
-    for idx, inst in enumerate(instances):
+    pbar = tqdm(range(len(instances)), desc="  Pool generation")
+    for idx in pbar:
+        inst = instances[idx]
         best_cost = float('inf')
 
         for restart in range(n_restarts):
@@ -125,6 +127,7 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=300,
             best_cost = min(best_cost, c)
 
         costs.append(best_cost)
+        pbar.set_postfix(samples=len(pool), cost=f"{best_cost:.2f}")
 
     return pool, costs
 
