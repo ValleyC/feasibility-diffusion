@@ -142,8 +142,55 @@ def make_mtsp():
     }
 
 
+def make_atsp():
+    from problems.atsp.manifold import ATSPManifold
+    N = 15
+    np.random.seed(10)
+    coords = np.random.rand(N, 2).astype(np.float32)
+    dist = dist_matrix_from_coords(coords)
+    noise = np.random.uniform(0.8, 1.2, (N, N)).astype(np.float32)
+    dist = dist * noise
+    np.fill_diagonal(dist, 0)
+    return "ATSP", ATSPManifold(), {'coords': coords, 'dist': dist, 'N': N}
+
+
+def make_ovrp():
+    from problems.ovrp.manifold import OVRPManifold
+    N = 15
+    np.random.seed(11)
+    coords = np.random.rand(N + 1, 2).astype(np.float32)
+    demands = np.zeros(N + 1, dtype=np.float32)
+    demands[1:] = np.random.randint(1, 10, N).astype(np.float32)
+    dist = dist_matrix_from_coords(coords)
+    return "OVRP", OVRPManifold(), {
+        'coords': coords, 'demands': demands, 'capacity': 30.0,
+        'dist': dist, 'n_customers': N,
+    }
+
+
+def make_spctsp():
+    from problems.spctsp.manifold import SPCTSPManifold
+    N = 15
+    np.random.seed(12)
+    coords = np.random.rand(N + 1, 2).astype(np.float32)
+    exp_prizes = np.zeros(N + 1, dtype=np.float32)
+    exp_prizes[1:] = np.random.uniform(0.1, 1.0, N).astype(np.float32)
+    stdev = np.zeros(N + 1, dtype=np.float32)
+    stdev[1:] = np.random.uniform(0.01, 0.3, N).astype(np.float32)
+    penalties = np.zeros(N + 1, dtype=np.float32)
+    penalties[1:] = np.random.uniform(0.1, 0.5, N).astype(np.float32)
+    dist = dist_matrix_from_coords(coords)
+    return "SPCTSP", SPCTSPManifold(), {
+        'coords': coords, 'expected_prizes': exp_prizes,
+        'prize_stdev': stdev, 'penalties': penalties,
+        'min_prize': float(exp_prizes.sum() * 0.5),
+        'dist': dist, 'n_customers': N,
+    }
+
+
 if __name__ == '__main__':
-    problems = [make_tsp(), make_cvrp(), make_pctsp(), make_op(),
+    problems = [make_tsp(), make_atsp(), make_cvrp(), make_ovrp(),
+                make_pctsp(), make_spctsp(), make_op(),
                 make_kp(), make_mis(), make_mtsp()]
 
     for name, manifold, instance in problems:

@@ -410,12 +410,86 @@ class MTSPConfig(ProblemConfig):
             return (a, 0, b, 0)
 
 
+# ─── ATSP ────────────────────────────────────────────────────
+
+class ATSPConfig(TSPConfig):
+    name = "ATSP"
+
+    def create_instance(self, N, seed):
+        np.random.seed(seed)
+        coords = np.random.rand(N, 2).astype(np.float32)
+        dist = dist_matrix_from_coords(coords)
+        # Make asymmetric: add random perturbation to break symmetry
+        noise = np.random.uniform(0.8, 1.2, (N, N)).astype(np.float32)
+        dist = dist * noise
+        np.fill_diagonal(dist, 0)
+        return {'coords': coords, 'dist': dist, 'N': N}
+
+    def create_manifold(self):
+        from problems.atsp.manifold import ATSPManifold
+        return ATSPManifold()
+
+
+# ─── OVRP ────────────────────────────────────────────────────
+
+class OVRPConfig(CVRPConfig):
+    name = "OVRP"
+
+    def create_manifold(self):
+        from problems.ovrp.manifold import OVRPManifold
+        return OVRPManifold()
+
+
+# ─── SPCTSP ──────────────────────────────────────────────────
+
+class SPCTSPConfig(PCTSPConfig):
+    name = "SPCTSP"
+    n_node_features = 8  # x, y, exp_prize, stdev, penalty, is_selected, is_depot, progress
+
+    def create_instance(self, N, seed):
+        np.random.seed(seed)
+        coords = np.random.rand(N + 1, 2).astype(np.float32)
+        exp_prizes = np.zeros(N + 1, dtype=np.float32)
+        exp_prizes[1:] = np.random.uniform(0.1, 1.0, N).astype(np.float32)
+        stdev = np.zeros(N + 1, dtype=np.float32)
+        stdev[1:] = np.random.uniform(0.01, 0.3, N).astype(np.float32)
+        penalties = np.zeros(N + 1, dtype=np.float32)
+        penalties[1:] = np.random.uniform(0.1, 0.5, N).astype(np.float32)
+        dist = dist_matrix_from_coords(coords)
+        return {
+            'coords': coords, 'expected_prizes': exp_prizes,
+            'prize_stdev': stdev, 'penalties': penalties,
+            'min_prize': float(exp_prizes.sum() * 0.5),
+            'dist': dist, 'n_customers': N,
+            'prizes': exp_prizes,  # alias for compatibility
+        }
+
+    def create_manifold(self):
+        from problems.spctsp.manifold import SPCTSPManifold
+        return SPCTSPManifold()
+
+    def build_node_features(self, solution, instance, progress):
+        N = instance['n_customers']
+        feats = np.zeros((N + 1, 8), dtype=np.float32)
+        feats[:, 0:2] = instance['coords']
+        feats[:, 2] = instance['expected_prizes']
+        feats[:, 3] = instance['prize_stdev']
+        feats[:, 4] = instance['penalties']
+        feats[:, 5] = solution.astype(np.float32)
+        feats[0, 6] = 1.0
+        feats[:, 7] = progress
+        return feats
+
+
 # ─── Registry ────────────────────────────────────────────────
 
 PROBLEM_CONFIGS = {
     'tsp': TSPConfig,
+    'atsp': ATSPConfig,
     'cvrp': CVRPConfig,
+    'ovrp': OVRPConfig,
     'pctsp': PCTSPConfig,
+    'spctsp': SPCTSPConfig,
     'op': OPConfig,
     'kp': KPConfig,
     'mis': MISConfig,
