@@ -35,7 +35,18 @@ class CVRPPartitionManifold(FeasibilityManifold):
         'capacity': float
         'dist': (N+1, N+1) — distance matrix
         'n_customers': int
+
+    Optional: set self.sub_solver to a callable(coords) -> cost
+    for faster sub-TSP evaluation (e.g., GPU-batched reviser).
     """
+
+    def __init__(self, sub_solver=None):
+        """
+        Args:
+            sub_solver: optional callable(coords_array) -> float tour cost.
+                        If None, uses built-in NN + 2-opt.
+        """
+        self.sub_solver = sub_solver
 
     def sample_random(self, instance: dict) -> np.ndarray:
         return random_partition(
@@ -47,6 +58,7 @@ class CVRPPartitionManifold(FeasibilityManifold):
     def cost(self, solution: np.ndarray, instance: dict) -> float:
         return partition_cost(
             solution, instance['coords'], instance['dist'], depot=0,
+            sub_tsp_solver=self.sub_solver,
         )
 
     def is_feasible(self, solution: np.ndarray, instance: dict) -> bool:
@@ -68,4 +80,5 @@ class CVRPPartitionManifold(FeasibilityManifold):
                    instance: dict) -> float:
         return delta_partition_move(
             solution, move, instance['coords'], instance['dist'], depot=0,
+            sub_solver=self.sub_solver,
         )

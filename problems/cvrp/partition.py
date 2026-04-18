@@ -237,7 +237,7 @@ def _solve_sub_tsp_2opt(sub_dist: np.ndarray) -> float:
 
 def delta_partition_move(assign: np.ndarray, move: PartMove,
                          coords: np.ndarray, dist: np.ndarray,
-                         depot: int = 0) -> float:
+                         depot: int = 0, sub_solver=None) -> float:
     """Compute cost change from a partition move.
 
     Since partition moves change which customers are in which vehicle,
@@ -257,6 +257,8 @@ def delta_partition_move(assign: np.ndarray, move: PartMove,
     else:
         return 0.0
 
+    _solver = sub_solver if sub_solver is not None else _solve_sub_tsp_2opt
+
     # Cost of affected vehicles BEFORE move
     cost_before = 0.0
     for k in affected:
@@ -264,7 +266,10 @@ def delta_partition_move(assign: np.ndarray, move: PartMove,
         if len(customers) == 0:
             continue
         nodes = [depot] + customers
-        cost_before += _solve_sub_tsp_2opt(dist[np.ix_(nodes, nodes)])
+        if sub_solver is not None:
+            cost_before += sub_solver(coords[nodes])
+        else:
+            cost_before += _solve_sub_tsp_2opt(dist[np.ix_(nodes, nodes)])
 
     # Cost of affected vehicles AFTER move
     new_assign = apply_partition_move(assign, move)
@@ -274,6 +279,9 @@ def delta_partition_move(assign: np.ndarray, move: PartMove,
         if len(customers) == 0:
             continue
         nodes = [depot] + customers
-        cost_after += _solve_sub_tsp_2opt(dist[np.ix_(nodes, nodes)])
+        if sub_solver is not None:
+            cost_after += sub_solver(coords[nodes])
+        else:
+            cost_after += _solve_sub_tsp_2opt(dist[np.ix_(nodes, nodes)])
 
     return cost_after - cost_before

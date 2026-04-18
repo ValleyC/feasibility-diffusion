@@ -97,7 +97,22 @@ def train(args):
     device = torch.device(args.device)
 
     ConfigClass = PROBLEM_CONFIGS[args.problem]
-    config = ConfigClass()
+
+    # Optional: use batched sub-TSP solver for CVRP-family problems
+    sub_solver_fn = None
+    if hasattr(args, 'sub_tsp') and args.sub_tsp and args.sub_tsp != '2opt':
+        from solvers.batched_subtsp import BatchedSubTSPSolver
+        reviser_path = getattr(args, 'reviser_path', None)
+        solver = BatchedSubTSPSolver(
+            reviser_path=reviser_path, device=device, method=args.sub_tsp
+        )
+        sub_solver_fn = solver.solve_single
+        print(f"Sub-TSP solver: {args.sub_tsp}")
+
+    if sub_solver_fn is not None and hasattr(ConfigClass, '__init__'):
+        config = ConfigClass(sub_solver_fn=sub_solver_fn)
+    else:
+        config = ConfigClass()
     manifold = config.create_manifold()
     print(f"Problem: {config.name}, N={args.N}, K={args.K} trajectories")
 
@@ -279,5 +294,11 @@ if __name__ == '__main__':
     parser.add_argument('--n_improve', type=int, default=None)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--ckpt_dir', type=str, default='./checkpoints')
+    parser.add_argument('--sub_tsp', type=str, default='2opt',
+                        choices=['2opt', 'nn', 'reviser'],
+                        help='Sub-TSP solver for CVRP: 2opt (default), nn (fast), reviser (GPU)')
+    parser.add_argument('--reviser_path', type=str,
+                        default='./pretrained/Reviser-stage2/reviser_10/epoch-299.pt',
+                        help='Path to GLOP reviser checkpoint')
     args = parser.parse_args()
     train(args)

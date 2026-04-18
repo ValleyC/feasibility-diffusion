@@ -102,6 +102,9 @@ class CVRPConfig(ProblemConfig):
     name = "CVRP"
     n_node_features = 6  # x, y, demand/cap, vehicle_id/K, is_depot, progress
 
+    def __init__(self, sub_solver_fn=None):
+        self._sub_solver_fn = sub_solver_fn
+
     def create_instance(self, N, seed):
         np.random.seed(seed)
         coords = np.random.rand(N + 1, 2).astype(np.float32)
@@ -114,7 +117,7 @@ class CVRPConfig(ProblemConfig):
 
     def create_manifold(self):
         from problems.cvrp.partition_manifold import CVRPPartitionManifold
-        return CVRPPartitionManifold()
+        return CVRPPartitionManifold(sub_solver=self._sub_solver_fn)
 
     def n_nodes(self, instance):
         return instance['n_customers'] + 1
