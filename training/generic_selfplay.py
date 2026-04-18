@@ -1,14 +1,15 @@
 """
-Generic self-play trainer for ANY CO problem.
+FMD self-play trainer for ANY CO problem.
 
-Same AlphaZero principle as TSP self-play, but works with any FeasibilityManifold:
-  Round 1: Train on greedy improvement trajectories
-  Round 2+: Best-of-K inference → upgrade targets → retrain
+Same self-play principle but with proper diffusion formulation:
+  Round 1: Train on quality-diverse solutions with Boltzmann soft targets
+  Round 2+: Best-of-K stochastic inference → upgrade targets → retrain
+
+Stochastic sampling provides diversity; best-of-K improves quality each round.
 
 Usage:
     python -m training.generic_selfplay --problem cvrp --N 50 --device cuda:0
     python -m training.generic_selfplay --problem tsp --N 50 --device cuda:0
-    python -m training.generic_selfplay --problem pctsp --N 20 --device cuda:0
 """
 
 import sys
@@ -25,13 +26,15 @@ from tqdm import tqdm
 from models.problem_configs import PROBLEM_CONFIGS
 from training.generic_trainer import (
     GenericMoveScorer, GNNLayer, build_sample_pool,
-    prepare_batch_item, greedy_denoise,
+    prepare_batch_item, greedy_denoise, stochastic_denoise,
+    best_of_k_denoise, boltzmann_target, calibrate_tau,
 )
 
 
 def selfplay_improve(model, config, manifold, instances, targets,
-                     max_moves, n_steps, device, K=8, n_improve=None):
-    """Best-of-K inference on instances, upgrade targets where improved."""
+                     max_moves, n_steps, device, K=8, n_improve=None,
+                     temperature=0.5):
+    """Best-of-K stochastic inference, upgrade targets where improved."""
     if n_improve is None:
         n_improve = len(instances)
     n_improve = min(n_improve, len(instances))
@@ -43,42 +46,10 @@ def selfplay_improve(model, config, manifold, instances, targets,
     for idx in pbar:
         old_cost = targets[idx]
 
-        best_cost = float('inf')
-        for _ in range(K):
-            sol = manifold.sample_random(instances[idx])
-
-            # Denoising with stochastic exploration
-            for step in range(n_steps):
-                moves = manifold.enumerate_moves(sol, instances[idx])
-                if len(moves) == 0 or len(moves) > max_moves:
-                    break
-
-                progress = step / max(n_steps - 1, 1)
-                nf, ei, mn, mm, _ = prepare_batch_item(
-                    config, sol, instances[idx], moves, 0, progress, max_moves
-                )
-
-                nf_t = torch.tensor(nf, dtype=torch.float32, device=device).unsqueeze(0)
-                ei_t = torch.tensor(ei, dtype=torch.long, device=device).unsqueeze(0)
-                mn_t = torch.tensor(mn, dtype=torch.long, device=device).unsqueeze(0)
-                mm_t = torch.tensor(mm, dtype=torch.bool, device=device).unsqueeze(0)
-
-                with torch.no_grad():
-                    scores = model(nf_t, ei_t, mn_t, mm_t)
-
-                if K > 1 and progress < 0.7:
-                    probs = F.softmax(scores.squeeze(0) / 0.5, dim=-1)
-                    best_idx = torch.multinomial(probs, 1).item()
-                else:
-                    best_idx = scores.argmax(dim=-1).item()
-
-                if best_idx < len(moves):
-                    d = manifold.move_delta(sol, moves[best_idx], instances[idx])
-                    if d < 0:
-                        sol = manifold.apply_move(sol, moves[best_idx])
-
-            cost = manifold.cost(sol, instances[idx])
-            best_cost = min(best_cost, cost)
+        _, best_cost = best_of_k_denoise(
+            model, config, manifold, instances[idx],
+            max_moves, n_steps, device, K=K, temperature=temperature,
+        )
 
         if best_cost < old_cost - 1e-8:
             new_targets[idx] = best_cost
@@ -98,7 +69,6 @@ def train(args):
 
     ConfigClass = PROBLEM_CONFIGS[args.problem]
 
-    # Optional: use batched sub-TSP solver for CVRP-family problems
     sub_solver_fn = None
     if hasattr(args, 'sub_tsp') and args.sub_tsp and args.sub_tsp != '2opt':
         from solvers.batched_subtsp import BatchedSubTSPSolver
@@ -127,14 +97,20 @@ def train(args):
     n_denoise = args.n_denoise if args.n_denoise else max(args.N * 3, 50)
     best_val_gap = float('inf')
 
+    # Auto-calibrate temperature
+    print("Calibrating temperature range...")
+    tau_min, tau_max = calibrate_tau(manifold, instances, args.max_moves)
+    print(f"  tau_min={tau_min:.4f}, tau_max={tau_max:.4f}")
+
     # Build initial targets BEFORE creating model on GPU
-    # (multiprocessing.Pool + CUDA fork = deadlock)
     print("Building initial targets...")
     _, train_targets = build_sample_pool(
-        config, manifold, instances, args.max_moves, n_restarts=3
+        config, manifold, instances, args.max_moves,
+        n_quality_levels=args.n_quality_levels,
     )
     _, val_targets = build_sample_pool(
-        config, manifold, val_instances, args.max_moves, n_restarts=3
+        config, manifold, val_instances, args.max_moves,
+        n_quality_levels=args.n_quality_levels,
     )
     print(f"Initial: train={np.mean(train_targets):.4f}, val={np.mean(val_targets):.4f}")
 
@@ -151,12 +127,12 @@ def train(args):
         print(f"ROUND {round_id}/{args.n_rounds}")
         print(f"{'='*60}")
 
-        # Build training samples (with degradation for diversity)
+        # Build training samples
         print("Building training samples...")
         t0 = time.time()
-        # After round 1, model is on GPU — use serial to avoid CUDA fork deadlock
         pool, _ = build_sample_pool(
-            config, manifold, instances, args.max_moves, n_restarts=3,
+            config, manifold, instances, args.max_moves,
+            n_quality_levels=args.n_quality_levels,
             n_workers=1 if round_id > 1 else None,
         )
         print(f"  {len(pool)} samples in {time.time()-t0:.1f}s")
@@ -180,49 +156,61 @@ def train(args):
 
             pbar = tqdm(range(args.steps_per_epoch), desc=f"  Epoch {epoch}", leave=False)
             for step in pbar:
-                batch_nf, batch_ei, batch_mn, batch_mm, batch_labels = [], [], [], [], []
+                batch_nf, batch_ei, batch_mn, batch_mm = [], [], [], []
+                batch_targets, batch_t = [], []
                 max_edges = 0
 
                 items = []
                 for _ in range(args.batch_size):
                     s_idx = np.random.randint(n_pool)
-                    inst_idx, sol, best_move, step_i = pool[s_idx]
-                    total = max(len([p for p in pool if p[0] == inst_idx]) - 1, 1)
-                    progress = step_i / total
+                    idx, sol, deltas, t = pool[s_idx]
 
-                    moves = manifold.enumerate_moves(sol, instances[inst_idx])
-                    best_idx = 0
-                    for mi, m in enumerate(moves):
-                        if m == best_move:
-                            best_idx = mi
-                            break
+                    tau_t = tau_min + t * (tau_max - tau_min)
+                    target = boltzmann_target(deltas, tau_t)
 
-                    nf, ei, mn, mm, label = prepare_batch_item(
-                        config, sol, instances[inst_idx], moves, best_idx,
-                        progress, args.max_moves
+                    moves = manifold.enumerate_moves(sol, instances[idx])
+                    if len(moves) != len(deltas):
+                        continue
+
+                    nf, ei, mn, mm, _ = prepare_batch_item(
+                        config, sol, instances[idx], moves, 0, t, args.max_moves
                     )
-                    items.append((nf, ei, mn, mm, label))
+                    items.append((nf, ei, mn, mm, target, t))
                     max_edges = max(max_edges, ei.shape[0])
 
-                for nf, ei, mn, mm, label in items:
+                if not items:
+                    continue
+
+                for nf, ei, mn, mm, target, t in items:
                     if ei.shape[0] < max_edges:
                         pad = np.zeros((max_edges - ei.shape[0], 2), dtype=np.int64)
                         ei = np.vstack([ei, pad])
+                    padded_target = np.zeros(args.max_moves, dtype=np.float32)
+                    padded_target[:len(target)] = target
+
                     batch_nf.append(nf)
                     batch_ei.append(ei)
                     batch_mn.append(mn)
                     batch_mm.append(mm)
-                    batch_labels.append(label)
+                    batch_targets.append(padded_target)
+                    batch_t.append(t)
 
                 nf_t = torch.tensor(np.stack(batch_nf), dtype=torch.float32, device=device)
                 ei_t = torch.tensor(np.stack(batch_ei), dtype=torch.long, device=device)
                 mn_t = torch.tensor(np.stack(batch_mn), dtype=torch.long, device=device)
                 mm_t = torch.tensor(np.stack(batch_mm), dtype=torch.bool, device=device)
-                labels_t = torch.tensor(batch_labels, dtype=torch.long, device=device)
+                targets_t = torch.tensor(np.stack(batch_targets), dtype=torch.float32, device=device)
+                t_t = torch.tensor(batch_t, dtype=torch.float32, device=device)
 
-                scores = model(nf_t, ei_t, mn_t, mm_t)
-                loss = F.cross_entropy(scores, labels_t)
-                acc = (scores.argmax(-1) == labels_t).float().mean().item()
+                scores = model(nf_t, ei_t, mn_t, mm_t, t_t)
+
+                log_probs = F.log_softmax(scores, dim=-1)
+                log_probs = log_probs.masked_fill(~mm_t, 0.0)
+                loss = -(targets_t * log_probs).sum(dim=-1).mean()
+
+                pred_top = scores.argmax(dim=-1)
+                target_top = targets_t.argmax(dim=-1)
+                acc = (pred_top == target_top).float().mean().item()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -237,39 +225,58 @@ def train(args):
             print(f"  Epoch {epoch}: loss={epoch_loss/args.steps_per_epoch:.4f}, "
                   f"acc={epoch_acc/args.steps_per_epoch:.2%}")
 
-        # Evaluate
-        print("  Evaluating...")
+        # Evaluate with greedy denoising
+        print("  Evaluating (greedy)...")
         val_costs = []
-        for idx in range(min(args.n_eval, len(val_instances))):
+        for vi in range(min(args.n_eval, len(val_instances))):
             _, cost = greedy_denoise(
-                model, config, manifold, val_instances[idx],
+                model, config, manifold, val_instances[vi],
                 args.max_moves, n_denoise, device
             )
             val_costs.append(cost)
         avg_cost = np.mean(val_costs)
         ref = np.mean(val_targets[:len(val_costs)])
         gap = (avg_cost / abs(ref) - 1) * 100 if abs(ref) > 1e-8 else 0
-        print(f"  Val: cost={avg_cost:.4f}, gap={gap:+.2f}% (ref={ref:.4f})")
+        print(f"  Val (greedy): cost={avg_cost:.4f}, gap={gap:+.2f}% (ref={ref:.4f})")
+
+        # Evaluate with best-of-K stochastic
+        print(f"  Evaluating (best-of-{args.K})...")
+        val_costs_bok = []
+        for vi in range(min(args.n_eval, len(val_instances))):
+            _, cost = best_of_k_denoise(
+                model, config, manifold, val_instances[vi],
+                args.max_moves, n_denoise, device, K=args.K,
+            )
+            val_costs_bok.append(cost)
+        avg_bok = np.mean(val_costs_bok)
+        gap_bok = (avg_bok / abs(ref) - 1) * 100 if abs(ref) > 1e-8 else 0
+        print(f"  Val (best-of-{args.K}): cost={avg_bok:.4f}, gap={gap_bok:+.2f}%")
 
         # Checkpoint
         path = os.path.join(args.ckpt_dir, f'round{round_id}_{args.problem}{args.N}.pt')
         torch.save({
             'round': round_id, 'model_state_dict': model.state_dict(),
-            'gap': gap, 'cost': avg_cost, 'problem': args.problem,
+            'gap_greedy': gap, 'gap_bok': gap_bok,
+            'cost_greedy': avg_cost, 'cost_bok': avg_bok,
+            'problem': args.problem,
+            'tau_min': tau_min, 'tau_max': tau_max,
             'args': vars(args),
         }, path)
 
-        if gap < best_val_gap:
-            best_val_gap = gap
+        eval_gap = min(gap, gap_bok)
+        if eval_gap < best_val_gap:
+            best_val_gap = eval_gap
             best_path = os.path.join(args.ckpt_dir, f'best_{args.problem}{args.N}.pt')
             torch.save({
                 'round': round_id, 'model_state_dict': model.state_dict(),
-                'gap': gap, 'cost': avg_cost, 'problem': args.problem,
+                'gap_greedy': gap, 'gap_bok': gap_bok,
+                'problem': args.problem,
+                'tau_min': tau_min, 'tau_max': tau_max,
                 'args': vars(args),
             }, best_path)
-            print(f"  [best] gap={gap:+.2f}% -> {best_path}")
+            print(f"  [best] gap={eval_gap:+.2f}% -> {best_path}")
 
-        # Self-play: improve targets
+        # Self-play: improve targets via stochastic best-of-K
         if round_id < args.n_rounds:
             model.eval()
             train_targets, n_improved = selfplay_improve(
@@ -285,7 +292,7 @@ def train(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Generic self-play for any CO problem')
+    parser = argparse.ArgumentParser(description='FMD self-play for any CO problem')
     parser.add_argument('--problem', type=str, required=True, choices=list(PROBLEM_CONFIGS.keys()))
     parser.add_argument('--N', type=int, default=20)
     parser.add_argument('--n_instances', type=int, default=2000)
@@ -298,7 +305,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--hidden_dim', type=int, default=64)
     parser.add_argument('--n_layers', type=int, default=4)
-    parser.add_argument('--K', type=int, default=8, help='Best-of-K for self-play')
+    parser.add_argument('--K', type=int, default=8, help='Best-of-K for stochastic sampling')
+    parser.add_argument('--n_quality_levels', type=int, default=5)
     parser.add_argument('--n_denoise', type=int, default=None)
     parser.add_argument('--n_eval', type=int, default=20)
     parser.add_argument('--n_improve', type=int, default=None)

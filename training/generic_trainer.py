@@ -1,18 +1,21 @@
 """
-Generic trainer for feasibility-preserving diffusion on ANY CO problem.
+Feasibility Manifold Diffusion (FMD) trainer for ANY CO problem.
 
-Works with any FeasibilityManifold + ProblemConfig. The training loop is
-problem-agnostic; only the feature extraction (via ProblemConfig) is
-problem-specific.
+CTMC diffusion on the feasibility manifold with Boltzmann score matching.
+The model learns to predict move quality (score) from soft Boltzmann targets
+derived from actual move deltas. At inference, the model replaces expensive
+delta computation with a single GNN forward pass.
 
-Training: greedy local-search trajectories generate (solution, best_move) pairs.
-Model: GNN on problem graph + 4-node MLP move scorer (shared across problems).
-Inference: greedy denoising from random feasible solution.
+Label-free: no optimal solutions needed. Self-play bootstraps quality.
+
+Training: solutions at various quality levels → compute deltas → Boltzmann
+  soft targets → train GNN to predict scores.
+Inference: start from random feasible solution → GNN scores moves → sample
+  or argmax → apply if improving → repeat.
 
 Usage:
     python -m training.generic_trainer --problem tsp --N 50 --device cuda:0
     python -m training.generic_trainer --problem cvrp --N 20 --device cuda:0
-    python -m training.generic_trainer --problem mis --N 50 --device cuda:0
 """
 
 import sys
@@ -32,7 +35,7 @@ from multiprocessing import cpu_count
 from models.problem_configs import PROBLEM_CONFIGS
 
 
-# ─── Model (shared across all problems) ─────────────────────
+# ─── Model ──────────────────────────────────────────────────────
 
 class GNNLayer(nn.Module):
     def __init__(self, hidden_dim):
@@ -58,20 +61,36 @@ class GNNLayer(nn.Module):
 
 
 class GenericMoveScorer(nn.Module):
+    """GNN move scorer with sinusoidal time conditioning for FMD."""
+
     def __init__(self, n_node_features, hidden_dim=64, n_layers=4):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.embed = nn.Sequential(nn.Linear(n_node_features, hidden_dim), nn.SiLU(),
-                                   nn.Linear(hidden_dim, hidden_dim))
+        self.time_embed = nn.Sequential(
+            nn.Linear(16, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.embed = nn.Sequential(
+            nn.Linear(n_node_features, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.gnn = nn.ModuleList([GNNLayer(hidden_dim) for _ in range(n_layers)])
-        self.scorer = nn.Sequential(nn.Linear(4 * hidden_dim, hidden_dim), nn.SiLU(),
-                                    nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
-                                    nn.Linear(hidden_dim, 1))
+        self.scorer = nn.Sequential(
+            nn.Linear(4 * hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
-    def forward(self, node_features, edge_index, move_nodes, move_mask):
+    def time_encoding(self, t):
+        freqs = torch.exp(torch.arange(0, 8, device=t.device).float() * (-np.log(10000) / 8))
+        args = t.unsqueeze(-1) * freqs
+        return torch.cat([args.sin(), args.cos()], dim=-1)
+
+    def forward(self, node_features, edge_index, move_nodes, move_mask, t):
         B, N, _ = node_features.shape
         D = self.hidden_dim
-        h = self.embed(node_features)
+        t_emb = self.time_embed(self.time_encoding(t))
+        h = self.embed(node_features) + t_emb.unsqueeze(1)
         for layer in self.gnn:
             h = layer(h, edge_index)
         M = move_nodes.shape[1]
@@ -82,77 +101,76 @@ class GenericMoveScorer(nn.Module):
         return scores.masked_fill(~move_mask, float('-inf'))
 
 
-# ─── Data generation ─────────────────────────────────────────
+# ─── Data generation ────────────────────────────────────────────
 
 def _process_one_instance(args):
-    """Process a single instance (for multiprocessing).
+    """Generate training samples at multiple quality levels.
 
-    Returns LIGHTWEIGHT samples: (idx, solution_copy, best_move, iteration).
-    Does NOT return the full moves list (too large for pipe serialization).
-    Moves are re-enumerated during batch preparation.
+    For each quality level, greedy-improve a random solution by a proportional
+    number of steps, then compute deltas for all feasible moves at that state.
+
+    Returns: (samples_list, best_cost)
+      samples: list of (idx, sol_copy, deltas_array, t)
     """
-    idx, inst, manifold_class, max_moves, max_iters, n_restarts = args
+    idx, inst, manifold_class, max_moves, n_quality_levels, max_improve_steps = args
 
     if isinstance(manifold_class, type):
         manifold = manifold_class()
     else:
         manifold = manifold_class
 
-    samples = []  # lightweight: (idx, solution, best_move, iteration)
+    samples = []
     best_cost = float('inf')
-    time_limit = 120  # seconds per instance — prevents hangs on outliers
+    time_limit = 120
     t_start = time.time()
 
-    for restart in range(n_restarts):
+    for ql in range(n_quality_levels):
         if time.time() - t_start > time_limit:
             break
 
         sol = manifold.sample_random(inst)
 
-        moves_init = manifold.enumerate_moves(sol, inst)
-        n_degrade = np.random.randint(0, max(len(moves_init) // 3, 1) + 1)
-        for _ in range(n_degrade):
-            mv = manifold.enumerate_moves(sol, inst)
-            if len(mv) == 0:
-                break
-            sol = manifold.apply_move(sol, mv[np.random.randint(len(mv))])
-
-        for iteration in range(max_iters):
+        n_improve = ql * max_improve_steps // max(n_quality_levels - 1, 1)
+        for _ in range(n_improve):
             if time.time() - t_start > time_limit:
                 break
             moves = manifold.enumerate_moves(sol, inst)
-            if len(moves) == 0 or len(moves) > max_moves:
+            if not moves or len(moves) > max_moves:
                 break
             deltas = np.array([manifold.move_delta(sol, m, inst) for m in moves])
-            best_move_idx = int(np.argmin(deltas))
-            if deltas[best_move_idx] >= -1e-10:
+            best = np.argmin(deltas)
+            if deltas[best] >= -1e-10:
                 break
-            best_move = moves[best_move_idx]
-            samples.append((idx, sol.copy() if hasattr(sol, 'copy') else sol,
-                           best_move, iteration))
-            sol = manifold.apply_move(sol, best_move)
+            sol = manifold.apply_move(sol, moves[best])
 
-        c = manifold.cost(sol, inst)
-        best_cost = min(best_cost, c)
+        moves = manifold.enumerate_moves(sol, inst)
+        if not moves or len(moves) > max_moves:
+            continue
+
+        deltas = np.array([manifold.move_delta(sol, m, inst) for m in moves],
+                          dtype=np.float32)
+        t = 1.0 - ql / max(n_quality_levels - 1, 1)
+
+        samples.append((idx, sol.copy() if hasattr(sol, 'copy') else sol,
+                        deltas, t))
+
+        cost = manifold.cost(sol, inst)
+        best_cost = min(best_cost, cost)
 
     return samples, best_cost
 
 
-def build_sample_pool(config, manifold, instances, max_moves, max_iters=100,
-                      n_restarts=3, n_workers=None):
-    """Build training samples from greedy improvement trajectories.
-
-    Uses multiprocessing for parallel generation across instances.
-    """
+def build_sample_pool(config, manifold, instances, max_moves,
+                      n_quality_levels=5, max_improve_steps=100,
+                      n_workers=None):
+    """Build training samples at multiple quality levels per instance."""
     if n_workers is None:
         n_workers = min(cpu_count(), 32)
 
-    # For multiprocessing: pass manifold CLASS (not instance) to avoid pickle issues
-    # Each worker creates a fresh manifold with built-in 2-opt (no GPU sub_solver)
     manifold_class = type(manifold)
 
     work_args = [
-        (idx, inst, manifold_class, max_moves, max_iters, n_restarts)
+        (idx, inst, manifold_class, max_moves, n_quality_levels, max_improve_steps)
         for idx, inst in enumerate(instances)
     ]
 
@@ -160,9 +178,8 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=100,
     costs = []
 
     if n_workers <= 1:
-        # Serial — use the original manifold (may have sub_solver)
         work_args_serial = [
-            (idx, inst, manifold, max_moves, max_iters, n_restarts)
+            (idx, inst, manifold, max_moves, n_quality_levels, max_improve_steps)
             for idx, inst in enumerate(instances)
         ]
         pbar = tqdm(work_args_serial, desc="  Pool generation")
@@ -172,9 +189,7 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=100,
             costs.append(cost)
             pbar.set_postfix(samples=len(sample_pool), cost=f"{cost:.2f}")
     else:
-        # Parallel — process results as they arrive (not collected into list)
-        # to avoid pipe backpressure that causes BrokenPipeError
-        print(f"  Pool generation: {len(instances)} instances × {n_restarts} restarts, "
+        print(f"  Pool generation: {len(instances)} instances × {n_quality_levels} levels, "
               f"{n_workers} workers")
         with mp.Pool(n_workers) as p:
             for samples, cost in tqdm(
@@ -188,9 +203,29 @@ def build_sample_pool(config, manifold, instances, max_moves, max_iters=100,
     return sample_pool, costs
 
 
-def prepare_batch_item(config, solution, instance, moves, best_idx, progress, max_moves):
+def calibrate_tau(manifold, instances, max_moves, n_samples=10):
+    """Estimate typical delta magnitude for temperature calibration."""
+    all_deltas = []
+    for inst in instances[:n_samples]:
+        sol = manifold.sample_random(inst)
+        moves = manifold.enumerate_moves(sol, inst)
+        for m in moves[:50]:
+            all_deltas.append(abs(manifold.move_delta(sol, m, inst)))
+    delta_scale = np.median(all_deltas) if all_deltas else 0.1
+    return delta_scale * 0.5, delta_scale * 5.0
+
+
+def boltzmann_target(deltas, tau):
+    """Soft target: softmax(-delta / tau). Favor improving moves."""
+    logits = -deltas / max(tau, 1e-8)
+    logits = logits - logits.max()
+    probs = np.exp(logits)
+    return (probs / probs.sum()).astype(np.float32)
+
+
+def prepare_batch_item(config, solution, instance, moves, best_idx, t, max_moves):
     """Prepare tensors for one training sample."""
-    node_features = config.build_node_features(solution, instance, progress)
+    node_features = config.build_node_features(solution, instance, t)
     edge_index = config.build_edges(solution, instance)
 
     move_nodes = np.zeros((max_moves, 4), dtype=np.int64)
@@ -205,10 +240,11 @@ def prepare_batch_item(config, solution, instance, moves, best_idx, progress, ma
     return node_features, edge_index, move_nodes, move_mask, label
 
 
-# ─── Inference ───────────────────────────────────────────────
+# ─── Inference ──────────────────────────────────────────────────
 
 @torch.no_grad()
 def greedy_denoise(model, config, manifold, instance, max_moves, n_steps, device):
+    """Greedy denoising: argmax scores, apply if delta < 0."""
     model.eval()
     sol = manifold.sample_random(instance)
 
@@ -217,18 +253,18 @@ def greedy_denoise(model, config, manifold, instance, max_moves, n_steps, device
         if len(moves) == 0 or len(moves) > max_moves:
             break
 
-        n_total = len([m for m in range(len(moves))])
-        progress = step / max(n_steps - 1, 1)
+        t_val = 1.0 - step / max(n_steps - 1, 1)
         nf, ei, mn, mm, _ = prepare_batch_item(
-            config, sol, instance, moves, 0, progress, max_moves
+            config, sol, instance, moves, 0, t_val, max_moves
         )
 
         nf_t = torch.tensor(nf, dtype=torch.float32, device=device).unsqueeze(0)
         ei_t = torch.tensor(ei, dtype=torch.long, device=device).unsqueeze(0)
         mn_t = torch.tensor(mn, dtype=torch.long, device=device).unsqueeze(0)
         mm_t = torch.tensor(mm, dtype=torch.bool, device=device).unsqueeze(0)
+        t_t = torch.tensor([t_val], dtype=torch.float32, device=device)
 
-        scores = model(nf_t, ei_t, mn_t, mm_t)
+        scores = model(nf_t, ei_t, mn_t, mm_t, t_t)
         best = scores.argmax(dim=-1).item()
 
         if best < len(moves):
@@ -240,12 +276,65 @@ def greedy_denoise(model, config, manifold, instance, max_moves, n_steps, device
     return sol, cost
 
 
-# ─── Main ────────────────────────────────────────────────────
+@torch.no_grad()
+def stochastic_denoise(model, config, manifold, instance, max_moves, n_steps,
+                       device, temperature=0.5):
+    """Stochastic denoising: sample from score distribution."""
+    model.eval()
+    sol = manifold.sample_random(instance)
+
+    for step in range(n_steps):
+        moves = manifold.enumerate_moves(sol, instance)
+        if len(moves) == 0 or len(moves) > max_moves:
+            break
+
+        t_val = 1.0 - step / max(n_steps - 1, 1)
+        temp = max(temperature * t_val, 0.05)
+
+        nf, ei, mn, mm, _ = prepare_batch_item(
+            config, sol, instance, moves, 0, t_val, max_moves
+        )
+
+        nf_t = torch.tensor(nf, dtype=torch.float32, device=device).unsqueeze(0)
+        ei_t = torch.tensor(ei, dtype=torch.long, device=device).unsqueeze(0)
+        mn_t = torch.tensor(mn, dtype=torch.long, device=device).unsqueeze(0)
+        mm_t = torch.tensor(mm, dtype=torch.bool, device=device).unsqueeze(0)
+        t_t = torch.tensor([t_val], dtype=torch.float32, device=device)
+
+        scores = model(nf_t, ei_t, mn_t, mm_t, t_t)
+        probs = F.softmax(scores.squeeze(0)[:len(moves)] / temp, dim=-1)
+        best = torch.multinomial(probs, 1).item()
+
+        if best < len(moves):
+            d = manifold.move_delta(sol, moves[best], instance)
+            if d < 0:
+                sol = manifold.apply_move(sol, moves[best])
+
+    cost = manifold.cost(sol, instance)
+    return sol, cost
+
+
+@torch.no_grad()
+def best_of_k_denoise(model, config, manifold, instance, max_moves, n_steps,
+                      device, K=8, temperature=0.5):
+    """Run K stochastic samples, return the best."""
+    best_sol, best_cost = None, float('inf')
+    for _ in range(K):
+        sol, cost = stochastic_denoise(
+            model, config, manifold, instance, max_moves, n_steps,
+            device, temperature
+        )
+        if cost < best_cost:
+            best_cost = cost
+            best_sol = sol
+    return best_sol, best_cost
+
+
+# ─── Training loop ──────────────────────────────────────────────
 
 def train(args):
     device = torch.device(args.device)
 
-    # Problem setup
     ConfigClass = PROBLEM_CONFIGS[args.problem]
     config = ConfigClass()
     manifold = config.create_manifold()
@@ -256,16 +345,27 @@ def train(args):
     instances = [config.create_instance(args.N, seed=42 + i) for i in range(args.n_instances)]
     val_instances = [config.create_instance(args.N, seed=99999 + i) for i in range(args.n_val)]
 
-    # Build training pool
+    # Auto-calibrate temperature
+    print("Calibrating temperature range...")
+    tau_min, tau_max = calibrate_tau(manifold, instances, args.max_moves)
+    print(f"  tau_min={tau_min:.4f}, tau_max={tau_max:.4f}")
+
+    # Build training pool (before GPU model to avoid CUDA fork deadlock)
     print("Building training sample pool...")
     t0 = time.time()
-    pool, train_costs = build_sample_pool(config, manifold, instances, args.max_moves)
+    pool, train_costs = build_sample_pool(
+        config, manifold, instances, args.max_moves,
+        n_quality_levels=args.n_quality_levels,
+    )
     print(f"  {len(pool)} samples in {time.time() - t0:.1f}s, "
-          f"avg converged cost: {np.mean(train_costs):.4f}")
+          f"avg cost: {np.mean(train_costs):.4f}")
 
-    _, val_costs = build_sample_pool(config, manifold, val_instances, args.max_moves)
+    _, val_costs = build_sample_pool(
+        config, manifold, val_instances, args.max_moves,
+        n_quality_levels=args.n_quality_levels,
+    )
 
-    # Model
+    # Model (create after pool generation)
     model = GenericMoveScorer(
         n_node_features=config.n_node_features,
         hidden_dim=args.hidden_dim,
@@ -288,53 +388,62 @@ def train(args):
 
         pbar = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch}")
         for step in pbar:
-            batch_nf, batch_ei, batch_mn, batch_mm, batch_labels = [], [], [], [], []
+            batch_nf, batch_ei, batch_mn, batch_mm = [], [], [], []
+            batch_targets, batch_t = [], []
             max_edges = 0
 
             items = []
             for _ in range(args.batch_size):
                 s_idx = np.random.randint(n_pool)
-                inst_idx, sol, best_move, step_i = pool[s_idx]
-                total_steps = max(
-                    len([p for p in pool if p[0] == inst_idx]) - 1, 1
-                )
-                progress = step_i / total_steps
+                idx, sol, deltas, t = pool[s_idx]
 
-                # Re-enumerate moves from solution (lightweight pool doesn't store them)
-                moves = manifold.enumerate_moves(sol, instances[inst_idx])
-                # Find index of the stored best_move
-                best_idx = 0
-                for mi, m in enumerate(moves):
-                    if m == best_move:
-                        best_idx = mi
-                        break
+                tau_t = tau_min + t * (tau_max - tau_min)
+                target = boltzmann_target(deltas, tau_t)
 
-                nf, ei, mn, mm, label = prepare_batch_item(
-                    config, sol, instances[inst_idx], moves, best_idx,
-                    progress, args.max_moves
+                moves = manifold.enumerate_moves(sol, instances[idx])
+                if len(moves) != len(deltas):
+                    continue
+
+                nf, ei, mn, mm, _ = prepare_batch_item(
+                    config, sol, instances[idx], moves, 0, t, args.max_moves
                 )
-                items.append((nf, ei, mn, mm, label))
+                items.append((nf, ei, mn, mm, target, t))
                 max_edges = max(max_edges, ei.shape[0])
 
-            for nf, ei, mn, mm, label in items:
+            if not items:
+                continue
+
+            for nf, ei, mn, mm, target, t in items:
                 if ei.shape[0] < max_edges:
                     pad = np.zeros((max_edges - ei.shape[0], 2), dtype=np.int64)
                     ei = np.vstack([ei, pad])
+                padded_target = np.zeros(args.max_moves, dtype=np.float32)
+                padded_target[:len(target)] = target
+
                 batch_nf.append(nf)
                 batch_ei.append(ei)
                 batch_mn.append(mn)
                 batch_mm.append(mm)
-                batch_labels.append(label)
+                batch_targets.append(padded_target)
+                batch_t.append(t)
 
             nf_t = torch.tensor(np.stack(batch_nf), dtype=torch.float32, device=device)
             ei_t = torch.tensor(np.stack(batch_ei), dtype=torch.long, device=device)
             mn_t = torch.tensor(np.stack(batch_mn), dtype=torch.long, device=device)
             mm_t = torch.tensor(np.stack(batch_mm), dtype=torch.bool, device=device)
-            labels_t = torch.tensor(batch_labels, dtype=torch.long, device=device)
+            targets_t = torch.tensor(np.stack(batch_targets), dtype=torch.float32, device=device)
+            t_t = torch.tensor(batch_t, dtype=torch.float32, device=device)
 
-            scores = model(nf_t, ei_t, mn_t, mm_t)
-            loss = F.cross_entropy(scores, labels_t)
-            acc = (scores.argmax(-1) == labels_t).float().mean().item()
+            scores = model(nf_t, ei_t, mn_t, mm_t, t_t)
+
+            log_probs = F.log_softmax(scores, dim=-1)
+            log_probs = log_probs.masked_fill(~mm_t, 0.0)
+            loss = -(targets_t * log_probs).sum(dim=-1).mean()
+
+            # Track accuracy: does model's top pick match Boltzmann's top pick?
+            pred_top = scores.argmax(dim=-1)
+            target_top = targets_t.argmax(dim=-1)
+            acc = (pred_top == target_top).float().mean().item()
 
             optimizer.zero_grad()
             loss.backward()
@@ -351,9 +460,9 @@ def train(args):
 
         if epoch % args.eval_freq == 0:
             eval_costs = []
-            for idx in range(min(args.n_eval, len(val_instances))):
+            for vi in range(min(args.n_eval, len(val_instances))):
                 _, cost = greedy_denoise(
-                    model, config, manifold, val_instances[idx],
+                    model, config, manifold, val_instances[vi],
                     args.max_moves, n_denoise, device
                 )
                 eval_costs.append(cost)
@@ -369,6 +478,7 @@ def train(args):
                 torch.save({
                     'epoch': epoch, 'model_state_dict': model.state_dict(),
                     'gap': gap, 'cost': avg_cost, 'problem': args.problem,
+                    'tau_min': tau_min, 'tau_max': tau_max,
                     'args': vars(args),
                 }, path)
                 print(f"  [checkpoint] best gap={gap:.2f}%")
@@ -389,6 +499,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--hidden_dim', type=int, default=64)
     parser.add_argument('--n_layers', type=int, default=4)
+    parser.add_argument('--n_quality_levels', type=int, default=5)
     parser.add_argument('--n_denoise', type=int, default=None)
     parser.add_argument('--eval_freq', type=int, default=5)
     parser.add_argument('--n_eval', type=int, default=20)
