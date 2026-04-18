@@ -123,19 +123,12 @@ def train(args):
     val_instances = [config.create_instance(args.N, seed=99999 + i)
                      for i in range(args.n_val)]
 
-    # Model
-    model = GenericMoveScorer(
-        n_node_features=config.n_node_features,
-        hidden_dim=args.hidden_dim,
-        n_layers=args.n_layers,
-    ).to(device)
-    print(f"Model: {sum(p.numel() for p in model.parameters()):,} params")
-
     os.makedirs(args.ckpt_dir, exist_ok=True)
     n_denoise = args.n_denoise if args.n_denoise else max(args.N * 3, 50)
     best_val_gap = float('inf')
 
-    # Initial targets (greedy improvement costs)
+    # Build initial targets BEFORE creating model on GPU
+    # (multiprocessing.Pool + CUDA fork = deadlock)
     print("Building initial targets...")
     _, train_targets = build_sample_pool(
         config, manifold, instances, args.max_moves, n_restarts=3
@@ -145,6 +138,14 @@ def train(args):
     )
     print(f"Initial: train={np.mean(train_targets):.4f}, val={np.mean(val_targets):.4f}")
 
+    # Model — create AFTER pool generation to avoid CUDA fork issues
+    model = GenericMoveScorer(
+        n_node_features=config.n_node_features,
+        hidden_dim=args.hidden_dim,
+        n_layers=args.n_layers,
+    ).to(device)
+    print(f"Model: {sum(p.numel() for p in model.parameters()):,} params")
+
     for round_id in range(1, args.n_rounds + 1):
         print(f"\n{'='*60}")
         print(f"ROUND {round_id}/{args.n_rounds}")
@@ -153,8 +154,10 @@ def train(args):
         # Build training samples (with degradation for diversity)
         print("Building training samples...")
         t0 = time.time()
+        # After round 1, model is on GPU — use serial to avoid CUDA fork deadlock
         pool, _ = build_sample_pool(
-            config, manifold, instances, args.max_moves, n_restarts=3
+            config, manifold, instances, args.max_moves, n_restarts=3,
+            n_workers=1 if round_id > 1 else None,
         )
         print(f"  {len(pool)} samples in {time.time()-t0:.1f}s")
 
