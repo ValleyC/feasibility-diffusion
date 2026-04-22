@@ -132,15 +132,77 @@ def sample_training_batch(manifold: FeasibilityManifold,
     return batch
 
 
+def scramble_with_moves(manifold: FeasibilityManifold,
+                        solution: np.ndarray,
+                        instance,
+                        n_steps: int) -> Tuple[np.ndarray, List]:
+    """Apply n_steps random moves, recording which moves were applied.
+
+    Returns:
+        (scrambled_solution, applied_moves)
+        where applied_moves[k] = the move applied at step k to go from s_k to s_{k+1}.
+    """
+    s = solution.copy()
+    applied_moves = []
+    for _ in range(n_steps):
+        moves = manifold.enumerate_moves(s, instance)
+        if not moves:
+            break
+        idx = np.random.randint(len(moves))
+        applied_moves.append(moves[idx])
+        s = manifold.apply_move(s, moves[idx])
+    return s, applied_moves
+
+
+def sample_reverse_training_data(manifold: FeasibilityManifold,
+                                 clean_solution: np.ndarray,
+                                 instance,
+                                 t_max: int,
+                                 t: Optional[int] = None,
+                                 ) -> Tuple[np.ndarray, int, int, List]:
+    """Generate a training sample for true reverse diffusion.
+
+    Forward: x_0 →(m_1)→ x_1 →(m_2)→ ... →(m_t)→ x_t
+    Target: at x_t, the model should predict m_t (the last applied move)
+            as the most likely reverse transition.
+
+    Returns:
+        (x_t, t, inverse_move_index, moves_at_xt)
+        - x_t: the noisy solution at step t
+        - t: the noise level
+        - inverse_move_index: index of the inverse move in enumerate_moves(x_t)
+          (for 2-opt, the inverse of 2-opt(i,j) is 2-opt(i,j) itself)
+        - moves_at_xt: the full move list at x_t (for scoring)
+    """
+    if t is None:
+        t = np.random.randint(1, t_max + 1)
+
+    x_t, applied_moves = scramble_with_moves(manifold, clean_solution, instance, t)
+
+    if not applied_moves:
+        return x_t, t, -1, []
+
+    last_move = applied_moves[-1]  # the move that produced x_t from x_{t-1}
+
+    # Enumerate moves at x_t and find the inverse
+    moves_at_xt = manifold.enumerate_moves(x_t, instance)
+
+    # Find the index of the inverse move in the move list
+    # For 2-opt: the inverse is the same (i,j) — 2-opt is self-inverse
+    inverse_idx = -1
+    for i, m in enumerate(moves_at_xt):
+        if m == last_move:
+            inverse_idx = i
+            break
+
+    return x_t, t, inverse_idx, moves_at_xt
+
+
 def compute_move_labels(manifold: FeasibilityManifold,
                         noisy_solution: np.ndarray,
                         instance: np.ndarray,
                         ) -> Tuple[List, np.ndarray]:
     """For each valid move, compute the cost change (delta).
-
-    The "label" for supervised training is the move with the most
-    negative delta (= biggest improvement). This is the greedy-optimal
-    single-step denoising action.
 
     Returns:
         moves: list of move descriptors
