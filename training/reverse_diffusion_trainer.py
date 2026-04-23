@@ -54,14 +54,19 @@ def generate_training_data(config, manifold, instances, clean_solutions,
             if inv_idx < 0 or not moves:
                 continue
 
-            # Truncate moves to max_moves
+            # If more moves than max_moves: random subsample ALWAYS keeping target
             n_moves = len(moves)
             if n_moves > max_moves:
-                # If inverse move is beyond max_moves, skip
-                if inv_idx >= max_moves:
-                    continue
-                moves = moves[:max_moves]
-                n_moves = max_moves
+                target_move = moves[inv_idx]
+                other_indices = [i for i in range(n_moves) if i != inv_idx]
+                keep_others = np.random.choice(
+                    other_indices, max_moves - 1, replace=False)
+                kept_moves = [moves[i] for i in sorted(keep_others)]
+                # Insert target move and track its new index
+                insert_pos = np.searchsorted(sorted(keep_others), inv_idx)
+                kept_moves.insert(insert_pos, target_move)
+                inv_idx = insert_pos
+                moves = kept_moves
 
             pool.append((idx, x_t, t_actual, inv_idx, moves))
 
@@ -88,8 +93,11 @@ def reverse_denoise(model, config, manifold, instance, max_moves, n_steps,
         moves = manifold.enumerate_moves(sol, instance)
         if not moves:
             break
-        n_use = min(len(moves), max_moves)
-        moves = moves[:n_use]
+        # Random subsample if too many (not prefix truncation)
+        if len(moves) > max_moves:
+            subset = np.random.choice(len(moves), max_moves, replace=False)
+            moves = [moves[i] for i in sorted(subset)]
+        n_use = len(moves)
 
         t_val = 1.0 - step / max(n_steps - 1, 1)
 
@@ -203,7 +211,7 @@ def train(args):
 
     n_pool = len(pool)
     best_gap = float('inf')
-    n_denoise = max(N * 3, 100)
+    n_denoise = t_max  # match inference horizon to training horizon
 
     for epoch in range(1, args.n_epochs + 1):
         model.train()
