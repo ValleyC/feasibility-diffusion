@@ -425,7 +425,7 @@ def train(args):
             epoch_cost += l_c
             n_steps += 1
             pbar.set_postfix(loss=f"{loss:.3f}", merge=f"{l_m:.3f}",
-                             risk=f"{l_r:.3f}", cost=f"{l_c:.3f}")
+                             risk=f"{l_r:.3f}")
 
         # Cost improvement via REINFORCE (every epoch after warmup)
         l_cost_avg = 0.0
