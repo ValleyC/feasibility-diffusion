@@ -106,15 +106,7 @@ def project(model, state: FragmentState, device: torch.device,
             f_src = state.fragments[src_idx]
             f_dst = state.fragments[dst_idx]
 
-            # Cost-based utility check: merge only if it saves distance
-            # compared to separate depot round-trips (savings criterion)
-            saving = (dist[f_src.end_node, depot] +
-                      dist[depot, f_dst.start_node] -
-                      dist[f_src.end_node, f_dst.start_node])
-            if saving <= 0 and model is not None:
-                continue  # merging would increase total distance
-
-            # Exact feasibility check
+            # Exact feasibility check (capacity + TW)
             feasible, cost = check_merge_feasible(
                 f_src, f_dst, state.instance, orientation=0)
 

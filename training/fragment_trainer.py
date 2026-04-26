@@ -45,48 +45,52 @@ def _apply_random_merges(state: FragmentState, elite_routes: List[List[int]],
                          n_merges: int) -> FragmentState:
     """Apply n_merges from an elite solution to create a partial state.
 
-    This simulates intermediate agglomeration states so the model
-    trains on the same distribution it sees at inference.
+    Only merges fragments whose endpoints are ACTUALLY CONSECUTIVE in the
+    elite route — not just on the same route. This produces valid partial
+    agglomeration states along the elite trajectory.
     """
-    # Build a map from customer to route index in the elite solution
-    cust_to_route = {}
-    for r_idx, route in enumerate(elite_routes):
-        for c in route:
-            cust_to_route[c] = r_idx
+    # Build adjacency set: (a, b) means customer a is immediately before b
+    # in some elite route (including depot connections)
+    elite_adjacency = set()
+    for route in elite_routes:
+        full = [0] + route + [0]  # depot → route → depot
+        for pos in range(len(full) - 1):
+            elite_adjacency.add((full[pos], full[pos + 1]))
 
-    # Find fragment pairs that should merge (same elite route, adjacent endpoints)
     for _ in range(n_merges):
         if state.n_fragments <= 1:
             break
 
-        # Try to find a valid merge from the elite solution
-        merged = False
-        indices = list(range(state.n_fragments))
-        np.random.shuffle(indices)
-
-        for i in indices:
-            for j in indices:
+        # Collect all valid merge candidates: f_i.end → f_j.start must be
+        # adjacent in the elite solution
+        candidates = []
+        for i in range(state.n_fragments):
+            for j in range(state.n_fragments):
                 if i == j:
                     continue
                 f_i = state.fragments[i]
                 f_j = state.fragments[j]
+                if (f_i.end_node, f_j.start_node) in elite_adjacency:
+                    candidates.append((i, j))
 
-                # Check if these fragments' endpoints are adjacent in the elite
-                # and on the same route
-                r_i = cust_to_route.get(f_i.end_node, -1)
-                r_j = cust_to_route.get(f_j.start_node, -2)
-                if r_i == r_j and r_i >= 0:
-                    feasible, _ = check_merge_feasible(
-                        f_i, f_j, state.instance, orientation=0)
-                    if feasible:
-                        state = state.apply_merge(i, j, orientation=0)
-                        merged = True
-                        break
-            if merged:
+        if not candidates:
+            break
+
+        # Pick a random valid merge
+        np.random.shuffle(candidates)
+        merged = False
+        for i, j in candidates:
+            f_i = state.fragments[i]
+            f_j = state.fragments[j]
+            feasible, _ = check_merge_feasible(
+                f_i, f_j, state.instance, orientation=0)
+            if feasible:
+                state = state.apply_merge(i, j, orientation=0)
+                merged = True
                 break
 
         if not merged:
-            break  # no more valid merges from elite
+            break
 
     return state
 
@@ -173,13 +177,12 @@ def build_training_batch(buffer: EliteBuffer, instances: list,
 
 
 def train_step(model, optimizer, batch, device, instances,
-               lambda_risk: float = 0.5, lambda_cost: float = 0.1):
-    """One training step with merge + risk + cost-ranking losses."""
+               lambda_risk: float = 0.5):
+    """One training step with merge + risk losses (supervised component)."""
     model.train()
     total_loss = 0.0
     total_l_merge = 0.0
     total_l_risk = 0.0
-    total_l_cost = 0.0
     n_items = 0
 
     for item in batch:
@@ -194,37 +197,16 @@ def train_step(model, optimizer, batch, device, instances,
 
         merge_scores, risk_scores = model(nf, ei, ef)
 
-        # L_merge: BCE on merge scores vs elite frequency
+        # L_merge: BCE on merge scores vs elite adjacency frequency
         l_merge = F.binary_cross_entropy_with_logits(merge_scores, ml)
 
         # L_risk: BCE on risk scores vs actual infeasibility
         l_risk = F.binary_cross_entropy(risk_scores, rl)
 
-        # L_cost: pairwise ranking — edges with higher merge_label should
-        # have higher merge_score. Sample pairs and enforce margin.
-        l_cost = torch.tensor(0.0, device=device)
-        if ml.sum() > 0 and (1 - ml).sum() > 0:
-            pos_mask = ml > 0.1
-            neg_mask = ml < 0.01
-            if pos_mask.any() and neg_mask.any():
-                pos_scores = merge_scores[pos_mask]
-                neg_scores = merge_scores[neg_mask]
-                # Sample min(16, available) pairs
-                n_pairs = min(16, len(pos_scores), len(neg_scores))
-                if n_pairs > 0:
-                    pi = torch.randint(len(pos_scores), (n_pairs,))
-                    ni = torch.randint(len(neg_scores), (n_pairs,))
-                    # Margin ranking: pos should be > neg by margin 1.0
-                    l_cost = F.margin_ranking_loss(
-                        pos_scores[pi], neg_scores[ni],
-                        torch.ones(n_pairs, device=device),
-                        margin=1.0)
-
-        loss = l_merge + lambda_risk * l_risk + lambda_cost * l_cost
+        loss = l_merge + lambda_risk * l_risk
         total_loss += loss.item()
         total_l_merge += l_merge.item()
         total_l_risk += l_risk.item()
-        total_l_cost += l_cost.item()
         n_items += 1
 
         optimizer.zero_grad()
@@ -234,8 +216,102 @@ def train_step(model, optimizer, batch, device, instances,
 
     if n_items == 0:
         return 0.0, 0.0, 0.0, 0.0
-    return (total_loss / n_items, total_l_merge / n_items,
-            total_l_risk / n_items, total_l_cost / n_items)
+    return total_loss / n_items, total_l_merge / n_items, total_l_risk / n_items, 0.0
+
+
+def cost_improvement_step(model, optimizer, instances, device,
+                          n_instances: int = 4, k: int = 20,
+                          lambda_cost: float = 0.1):
+    """Cost-aware training step via REINFORCE on decoded route cost.
+
+    Runs the projector with the current model, computes decoded cost,
+    and uses REINFORCE to push merge scores toward lower-cost decodings.
+
+    This is the actual cost signal — not label imitation.
+    """
+    model.train()
+
+    log_probs_all = []
+    rewards_all = []
+
+    for _ in range(n_instances):
+        inst_idx = np.random.randint(len(instances))
+        inst = instances[inst_idx]
+
+        state = FragmentState.from_singletons(inst)
+        collected_log_probs = []
+
+        # Run projector-like loop but collect log-probs for REINFORCE
+        for step in range(inst['n_customers']):
+            if state.n_fragments <= 1:
+                break
+
+            node_feat, edge_index, edge_feat = build_fragment_graph(state, k=k)
+            if len(edge_index) == 0:
+                break
+
+            nf_t = torch.tensor(node_feat, dtype=torch.float32, device=device)
+            ei_t = torch.tensor(edge_index, dtype=torch.long, device=device)
+            ef_t = torch.tensor(edge_feat, dtype=torch.float32, device=device)
+
+            merge_scores, risk_scores = model(nf_t, ei_t, ef_t)
+
+            # Build distribution over feasible merges
+            feasible_mask = (risk_scores < 0.8)
+            if not feasible_mask.any():
+                break
+
+            masked_scores = merge_scores.clone()
+            masked_scores[~feasible_mask] = float('-inf')
+
+            # Sample from softmax over merge scores
+            probs = F.softmax(masked_scores, dim=0)
+            if torch.isnan(probs).any() or probs.sum() < 1e-8:
+                break
+
+            action = torch.multinomial(probs, 1).item()
+            collected_log_probs.append(torch.log(probs[action] + 1e-10))
+
+            src_idx = edge_index[action, 0]
+            dst_idx = edge_index[action, 1]
+            f_src = state.fragments[src_idx]
+            f_dst = state.fragments[dst_idx]
+
+            feasible, _ = check_merge_feasible(
+                f_src, f_dst, inst, orientation=0)
+            if feasible:
+                state = state.apply_merge(src_idx, dst_idx, orientation=0)
+            else:
+                break  # sampled an infeasible merge, stop this trajectory
+
+        if collected_log_probs:
+            # Reward = negative decoded cost (lower cost = higher reward)
+            decoded_cost = state.total_cost()
+            reward = -decoded_cost
+
+            log_probs_all.append(torch.stack(collected_log_probs))
+            rewards_all.append(reward)
+
+    if not log_probs_all:
+        return 0.0
+
+    # REINFORCE: normalize rewards, compute policy gradient
+    rewards = np.array(rewards_all)
+    reward_mean = rewards.mean()
+    reward_std = max(rewards.std(), 1e-8)
+    normalized = (rewards - reward_mean) / reward_std
+
+    policy_loss = torch.tensor(0.0, device=device)
+    for lp, r in zip(log_probs_all, normalized):
+        policy_loss = policy_loss - (lp.sum() * r)
+    policy_loss = policy_loss / len(log_probs_all) * lambda_cost
+
+    optimizer.zero_grad()
+    policy_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+
+    return policy_loss.item()
 
 
 @torch.no_grad()
@@ -351,11 +427,22 @@ def train(args):
             pbar.set_postfix(loss=f"{loss:.3f}", merge=f"{l_m:.3f}",
                              risk=f"{l_r:.3f}", cost=f"{l_c:.3f}")
 
+        # Cost improvement via REINFORCE (every epoch after warmup)
+        l_cost_avg = 0.0
+        if epoch >= 3:
+            for _ in range(args.cost_steps_per_epoch):
+                l_c = cost_improvement_step(
+                    model, optimizer, train_instances, device,
+                    n_instances=4, k=args.k, lambda_cost=0.05)
+                l_cost_avg += l_c
+            if args.cost_steps_per_epoch > 0:
+                l_cost_avg /= args.cost_steps_per_epoch
+
         scheduler.step()
         if n_steps > 0:
             print(f"  Epoch {epoch}: loss={epoch_loss/n_steps:.4f} "
                   f"[merge={epoch_merge/n_steps:.3f} risk={epoch_risk/n_steps:.3f} "
-                  f"cost={epoch_cost/n_steps:.3f}]")
+                  f"cost_rl={l_cost_avg:.3f}]")
 
         # Evaluate
         if epoch % args.eval_freq == 0 or epoch == args.n_epochs:
@@ -418,6 +505,8 @@ if __name__ == '__main__':
     parser.add_argument('--k', type=int, default=20)
     parser.add_argument('--eval_freq', type=int, default=5)
     parser.add_argument('--self_improve_freq', type=int, default=10)
+    parser.add_argument('--cost_steps_per_epoch', type=int, default=5,
+                        help='REINFORCE cost-improvement steps per epoch')
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--ckpt_dir', type=str, default='./checkpoints/fragment')
     args = parser.parse_args()
