@@ -19,7 +19,7 @@ import torch
 from typing import List, Optional, Tuple
 
 from route_objects.fragment import (
-    RouteFragment, check_merge_feasible, merge_fragments,
+    RouteFragment, create_singleton, check_merge_feasible, merge_fragments,
     route_cost_with_depot, simulate_route,
 )
 from route_objects.fragment_state import FragmentState, build_fragment_graph
@@ -29,8 +29,15 @@ from route_objects.fragment_state import FragmentState, build_fragment_graph
 def project(model, state: FragmentState, device: torch.device,
             k: int = 20, max_steps: int = 200,
             risk_threshold: float = 0.8,
-            min_fragments: int = 1) -> FragmentState:
+            min_fragments: int = 1,
+            score_threshold: float = 0.0) -> FragmentState:
     """Run constrained agglomeration using model-scored merges.
+
+    Stops when:
+      - No feasible merge exists
+      - Best merge score is below score_threshold (utility-based stopping)
+      - min_fragments reached
+      - max_steps exhausted
 
     Args:
         model: FragmentGNN (or None for random baseline)
@@ -40,12 +47,16 @@ def project(model, state: FragmentState, device: torch.device,
         max_steps: maximum merge steps
         risk_threshold: reject candidates with risk > threshold
         min_fragments: stop when this many fragments remain
+        score_threshold: stop when best merge score < this value
 
     Returns:
         Final FragmentState with merged fragments.
     """
     if model is not None:
         model.eval()
+
+    dist = state.instance['dist']
+    depot = 0
 
     for step in range(max_steps):
         if state.n_fragments <= min_fragments:
@@ -76,6 +87,12 @@ def project(model, state: FragmentState, device: torch.device,
 
         merged = False
         for rank_idx in order:
+            score = merge_scores[rank_idx]
+
+            # Utility-based stopping: don't merge if score is too low
+            if model is not None and score < score_threshold:
+                break  # scores are sorted, so all remaining are worse
+
             # Risk filter
             if risk_scores[rank_idx] > risk_threshold:
                 continue
@@ -89,7 +106,15 @@ def project(model, state: FragmentState, device: torch.device,
             f_src = state.fragments[src_idx]
             f_dst = state.fragments[dst_idx]
 
-            # Orientation: src.end → dst.start (orientation=0 by edge construction)
+            # Cost-based utility check: merge only if it saves distance
+            # compared to separate depot round-trips (savings criterion)
+            saving = (dist[f_src.end_node, depot] +
+                      dist[depot, f_dst.start_node] -
+                      dist[f_src.end_node, f_dst.start_node])
+            if saving <= 0 and model is not None:
+                continue  # merging would increase total distance
+
+            # Exact feasibility check
             feasible, cost = check_merge_feasible(
                 f_src, f_dst, state.instance, orientation=0)
 
@@ -165,41 +190,44 @@ def finalize_routes(state: FragmentState) -> List[List[int]]:
 
 
 def local_search_repair(state: FragmentState, max_steps: int = 50) -> FragmentState:
-    """Short local search polish using relocate/swap moves.
+    """Short local search polish using relocate moves.
 
-    Reuses the existing partition-based moves from problems/cvrp/partition.py
-    and CVRPTW feasibility checking.
+    Computes current route costs freshly at each step (no stale references).
     """
     instance = state.instance
-    dist = instance['dist']
     capacity = instance['capacity']
     demands = instance['demands']
-    tw_early = instance['tw_early']
-    tw_late = instance['tw_late']
-    service_time = instance['service_time']
 
-    # Build assignment vector from current fragments
-    n_total = instance['n_customers'] + 1
-    assign = np.full(n_total, -1, dtype=np.int64)
-    route_seqs = []
+    # Work with mutable route sequences
+    route_seqs = [list(f.seq) for f in state.fragments]
 
-    for k, frag in enumerate(state.fragments):
-        for c in frag.seq:
-            assign[c] = k
-        route_seqs.append(list(frag.seq))
+    def _route_cost(seq):
+        if not seq:
+            return 0.0
+        ok, c = simulate_route(seq, instance)
+        return c if ok else float('inf')
 
-    # Simple relocate-based local search
-    improved = True
+    # Cache current costs (recomputed after every accepted move)
+    route_costs = [_route_cost(s) for s in route_seqs]
+
     step = 0
-    while improved and step < max_steps:
+    while step < max_steps:
         improved = False
         step += 1
 
         for k_src in range(len(route_seqs)):
             if not route_seqs[k_src]:
                 continue
-            for ci, c in enumerate(list(route_seqs[k_src])):
-                # Try relocating customer c to another route
+            for c in list(route_seqs[k_src]):
+                best_gain = 0.0
+                best_move = None
+
+                # Cost of removing c from src
+                new_src = [cc for cc in route_seqs[k_src] if cc != c]
+                ok_src, cost_new_src = simulate_route(new_src, instance) if new_src else (True, 0.0)
+                if not ok_src:
+                    continue
+
                 for k_dst in range(len(route_seqs)):
                     if k_dst == k_src:
                         continue
@@ -209,35 +237,44 @@ def local_search_repair(state: FragmentState, max_steps: int = 50) -> FragmentSt
                     if dst_load + demands[c] > capacity + 1e-8:
                         continue
 
-                    # Try inserting c into dst route
-                    new_dst = route_seqs[k_dst] + [c]
-                    feasible_dst, cost_dst = simulate_route(new_dst, instance)
-                    if not feasible_dst:
+                    # Try best insertion position in dst
+                    best_insert_cost = float('inf')
+                    best_insert_pos = -1
+                    for pos in range(len(route_seqs[k_dst]) + 1):
+                        new_dst = route_seqs[k_dst][:pos] + [c] + route_seqs[k_dst][pos:]
+                        ok_dst, cost_new_dst = simulate_route(new_dst, instance)
+                        if ok_dst and cost_new_dst < best_insert_cost:
+                            best_insert_cost = cost_new_dst
+                            best_insert_pos = pos
+
+                    if best_insert_pos < 0:
                         continue
 
-                    new_src = [cc for cc in route_seqs[k_src] if cc != c]
-                    feasible_src, cost_src = simulate_route(new_src, instance)
-                    if not feasible_src and new_src:
-                        continue
+                    # Gain = old costs - new costs (positive = improvement)
+                    gain = (route_costs[k_src] + route_costs[k_dst]) - \
+                           (cost_new_src + best_insert_cost)
 
-                    # Compute cost change
-                    old_cost_src = route_cost_with_depot(state.fragments[k_src], instance) if route_seqs[k_src] else 0
-                    old_cost_dst = route_cost_with_depot(state.fragments[k_dst], instance) if route_seqs[k_dst] else 0
-                    new_total = cost_src + cost_dst
-                    old_total = old_cost_src + old_cost_dst
+                    if gain > best_gain + 1e-8:
+                        best_gain = gain
+                        best_move = (k_dst, best_insert_pos, new_src,
+                                     cost_new_src, best_insert_cost)
 
-                    if new_total < old_total - 1e-8:
-                        route_seqs[k_src] = new_src
-                        route_seqs[k_dst] = new_dst
-                        improved = True
-                        break
-                if improved:
-                    break
+                if best_move is not None:
+                    k_dst, pos, new_src, cost_new_src, cost_new_dst = best_move
+                    new_dst = route_seqs[k_dst][:pos] + [c] + route_seqs[k_dst][pos:]
+                    route_seqs[k_src] = new_src
+                    route_seqs[k_dst] = new_dst
+                    route_costs[k_src] = cost_new_src
+                    route_costs[k_dst] = cost_new_dst
+                    improved = True
+                    break  # restart scan
             if improved:
                 break
 
+        if not improved:
+            break
+
     # Rebuild fragments from modified routes
-    from route_objects.fragment import create_singleton, merge_fragments
     new_frags = []
     for seq in route_seqs:
         if not seq:

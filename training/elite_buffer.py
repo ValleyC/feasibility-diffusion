@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from route_objects.fragment import simulate_route
 from route_objects.fragment_state import FragmentState
-from route_objects.projector import project_savings, finalize_routes
+from route_objects.projector import project_savings, project_random, finalize_routes, local_search_repair
 
 
 @dataclass
@@ -36,27 +36,41 @@ class EliteBuffer:
         }
 
     def initialize_with_savings(self, n_restarts: int = 5):
-        """Generate initial elite solutions using Clarke-Wright savings."""
+        """Generate initial elite solutions using savings + random perturbation."""
         for i, inst in enumerate(self.instances):
-            for restart in range(n_restarts):
+            # First restart: pure savings (deterministic)
+            state = FragmentState.from_singletons(inst)
+            state = project_savings(state, max_steps=500)
+            state = local_search_repair(state, max_steps=50)
+            routes = [f.seq for f in state.fragments]
+            cost = state.total_cost()
+            self.add(i, routes, cost)
+
+            # Additional restarts: random merges + repair (for diversity)
+            for restart in range(1, n_restarts):
                 state = FragmentState.from_singletons(inst)
-                state = project_savings(state, max_steps=500)
+                state = project_random(state, max_steps=500)
+                state = local_search_repair(state, max_steps=100)
                 routes = [f.seq for f in state.fragments]
                 cost = state.total_cost()
                 self.add(i, routes, cost)
 
     def add(self, instance_idx: int, routes: List[List[int]], cost: float) -> bool:
-        """Add a solution if it improves the elite set.
+        """Add a solution if it actually enters the retained top-K.
 
-        Returns True if the solution was added.
+        Returns True only if the solution survives the top-K truncation.
         """
         sol = EliteSolution(routes=routes, cost=cost)
         buf = self.solutions[instance_idx]
 
-        # Check if this is a duplicate (same cost within tolerance)
+        # Duplicate check
         for existing in buf:
             if abs(existing.cost - cost) < 1e-8:
                 return False
+
+        # If buffer is full and this is worse than the worst elite, reject
+        if len(buf) >= self.n_elite and cost >= buf[-1].cost - 1e-8:
+            return False
 
         buf.append(sol)
         buf.sort(key=lambda s: s.cost)
